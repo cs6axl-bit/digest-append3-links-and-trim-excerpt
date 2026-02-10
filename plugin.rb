@@ -25,10 +25,10 @@ after_initialize do
 
     # --- Trimming switches ---
     ENABLE_TRIM_HTML_PART = true
-    HTML_MAX_CHARS        = 400
+    HTML_MAX_CHARS        = 350
 
     ENABLE_TRIM_TEXT_PART = true
-    TEXT_MAX_CHARS        = 400
+    TEXT_MAX_CHARS        = 350
 
     # HTML excerpt selectors (best-effort across Discourse versions/templates)
     HTML_EXCERPT_SELECTORS = [
