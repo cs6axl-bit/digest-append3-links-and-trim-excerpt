@@ -1,7 +1,8 @@
 # name: digest-append3-links-and-trim-excerpt
-# version: 0.9
+# version: 1.1
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
+#        HTML trim now preserves existing markup/spacing by trimming text nodes in-place (no wiping children).
 
 after_initialize do
   require_dependency "user_notifications"
@@ -20,17 +21,14 @@ after_initialize do
     # CONFIG
     # ============================================================
 
-    # --- Link rewrite ---
     ENABLE_LINK_REWRITE = true
 
-    # --- Trimming switches ---
     ENABLE_TRIM_HTML_PART = true
-    HTML_MAX_CHARS        = 350
+    HTML_MAX_CHARS        = 300
 
     ENABLE_TRIM_TEXT_PART = true
-    TEXT_MAX_CHARS        = 350
+    TEXT_MAX_CHARS        = 300
 
-    # HTML excerpt selectors (best-effort across Discourse versions/templates)
     HTML_EXCERPT_SELECTORS = [
       ".digest-post-excerpt",
       ".post-excerpt",
@@ -39,14 +37,11 @@ after_initialize do
       "div[itemprop='articleBody']"
     ]
 
-    # Safety: never touch these links; also never trim any node containing them
     NEVER_TOUCH_HREF_SUBSTRINGS = [
       "/email/unsubscribe",
       "/my/preferences"
     ]
 
-    # TEXT trimming: only trim blocks that FOLLOW a topic URL line (usually contains "/t/").
-    # Also never trim blocks containing unsubscribe/preferences keywords.
     TEXT_TOPIC_URL_REGEX = %r{(^|\s)(https?://\S+)?/t/[^ \n]+}i
     TEXT_NEVER_TRIM_KEYWORDS = [
       "unsubscribe",
@@ -62,7 +57,6 @@ after_initialize do
     def digest(user, opts = {})
       super.tap do |message|
         email_id = ::DigestAppendData.generate_email_id
-
         ::DigestAppendData.process_html_part!(message, user, email_id)
         ::DigestAppendData.trim_digest_text_part!(message)
       end
@@ -86,7 +80,12 @@ after_initialize do
       s.to_s.gsub(/\r\n?/, "\n").gsub(/[ \t]+/, " ").strip
     end
 
-    def self.smart_trim(text, max_chars)
+    def self.contains_any?(haystack, needles)
+      h = haystack.to_s
+      needles.any? { |n| h.include?(n) }
+    end
+
+    def self.smart_trim_plain(text, max_chars)
       t = normalize_spaces(text)
       return t if t.length <= max_chars
 
@@ -98,13 +97,60 @@ after_initialize do
       cut.rstrip + "…"
     end
 
-    def self.contains_any?(haystack, needles)
-      h = haystack.to_s
-      needles.any? { |n| h.include?(n) }
+    # ============================================================
+    # HTML: trim in-place by editing text nodes (preserves <p> spacing)
+    # ============================================================
+
+    def self.trim_html_node_in_place!(node, max_chars)
+      # total visible text
+      full = node.text.to_s
+      full_norm = normalize_spaces(full)
+      return false if full_norm.length <= max_chars
+
+      # Gather ALL text nodes under this node (excluding script/style)
+      text_nodes = node.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]").to_a
+      return false if text_nodes.empty?
+
+      # We trim from the end backwards until within limit
+      remaining = full_norm.length
+
+      # To avoid expensive re-normalization each time, we approximate per-node lengths by normalized text.
+      # This is fine for email excerpts (mostly plain).
+      text_nodes.reverse_each do |tn|
+        t = tn.text.to_s
+        t_norm = normalize_spaces(t)
+        next if t_norm.empty?
+
+        if remaining <= max_chars
+          break
+        end
+
+        over = remaining - max_chars
+
+        if t_norm.length <= over
+          # remove this text node entirely
+          tn.remove
+          remaining -= t_norm.length
+        else
+          # shorten this node and finish
+          new_text = smart_trim_plain(t_norm, t_norm.length - over)
+          # Ensure ellipsis only once at the very end
+          new_text = new_text.sub(/…+$/, "") # strip existing ellipsis from smart trim
+          new_text = smart_trim_plain(t_norm, (t_norm.length - over))
+          # smart_trim_plain already adds "…"
+          tn.content = new_text
+          remaining = max_chars
+          break
+        end
+      end
+
+      true
+    rescue
+      false
     end
 
     # ============================================================
-    # HTML processing (single Nokogiri pass + cheap pre-checks)
+    # HTML processing (single Nokogiri pass)
     # ============================================================
 
     def self.process_html_part!(message, user, email_id)
@@ -123,9 +169,7 @@ after_initialize do
 
       base = Discourse.base_url
 
-      # ----------------------------
-      # Cheap skip path (no Nokogiri)
-      # ----------------------------
+      # Cheap skip if no work
       if ENABLE_LINK_REWRITE && !body.include?('href="') && !body.include?("href='")
         return unless ENABLE_TRIM_HTML_PART
       end
@@ -136,8 +180,8 @@ after_initialize do
         return if !has_trim_hint && !ENABLE_LINK_REWRITE
       end
 
-      # Nokogiri missing => regex rewrite only, skip HTML trimming
       if !Nokogiri
+        # Regex rewrite only; skip HTML trimming
         if ENABLE_LINK_REWRITE
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
@@ -202,24 +246,16 @@ after_initialize do
             .flat_map { |sel| doc.css(sel).to_a }
             .uniq
 
-        if nodes.any?
-          nodes.each do |node|
-            begin
-              if node.css("a[href]").any?
-                hrefs = node.css("a[href]").map { |x| x["href"].to_s }
-                next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
-              end
-            rescue
-              next
-            end
+        nodes.each do |node|
+          # Never trim if node contains unsubscribe/preferences links
+          begin
+            hrefs = node.css("a[href]").map { |x| x["href"].to_s }
+            next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
+          rescue
+            next
+          end
 
-            text = node.text.to_s.strip
-            next if text.empty?
-            next if text.length <= HTML_MAX_CHARS
-
-            trimmed = smart_trim(text, HTML_MAX_CHARS)
-            node.children.remove
-            node.add_child(Nokogiri::XML::Text.new(trimmed, doc))
+          if trim_html_node_in_place!(node, HTML_MAX_CHARS)
             changed = true
           end
         end
@@ -251,7 +287,7 @@ after_initialize do
     end
 
     # ============================================================
-    # TEXT trimming (topic-body-only, footer-safe, cheap string ops)
+    # TEXT trimming (topic-body-only)
     # ============================================================
 
     def self.trim_digest_text_part!(message)
@@ -282,7 +318,7 @@ after_initialize do
         norm_len = normalize_spaces(b).length
         next if norm_len <= TEXT_MAX_CHARS
 
-        blocks[i] = smart_trim(b, TEXT_MAX_CHARS)
+        blocks[i] = smart_trim_plain(b, TEXT_MAX_CHARS)
         changed = true
       end
 
