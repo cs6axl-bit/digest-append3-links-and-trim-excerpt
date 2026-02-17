@@ -1,9 +1,12 @@
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.2
+# version: 1.3
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
-#        HTML trim preserves markup by trimming text nodes in-place (no wiping children).
-#        If only ONE topic exists *before* the "Popular Posts" section, excerpt trimming is skipped (HTML + TEXT).
+#        HTML trim preserves markup by trimming text nodes in-place.
+#        NEW (v1.2): Count topics ONLY before "Popular Posts" section.
+#        NEW (v1.3): Count topics by UNIQUE topic_id (from /t/.../<id>) to avoid overcount when one topic renders multiple excerpt blocks.
+#        NEW (v1.3): HTML trimming now trims FORWARD (keeps early paragraphs), not reverse-deleting later nodes.
+#        NEW (v1.3): normalize_spaces collapses ALL whitespace so we don't cut early at line breaks.
 
 after_initialize do
   require_dependency "user_notifications"
@@ -83,8 +86,9 @@ after_initialize do
       Base64.urlsafe_encode64(email, padding: false)
     end
 
+    # IMPORTANT: collapse ALL whitespace (including newlines) into spaces
     def self.normalize_spaces(s)
-      s.to_s.gsub(/\r\n?/, "\n").gsub(/[ \t]+/, " ").strip
+      s.to_s.gsub(/\s+/, " ").strip
     end
 
     def self.contains_any?(haystack, needles)
@@ -119,7 +123,6 @@ after_initialize do
     def self.scoped_doc_before_popular(doc)
       return doc unless doc
 
-      # Find a "Popular Posts" marker node (often in a heading/strong/td/etc)
       marker =
         doc.css("h1,h2,h3,h4,h5,h6,strong,b,td,th,p,div,span").find do |n|
           node_text_matches_popular?(n)
@@ -130,7 +133,7 @@ after_initialize do
       body = doc.at("body")
       return doc unless body
 
-      # Build HTML containing only body children BEFORE the marker's top-level ancestor under body.
+      # Find the top-level body child that contains the marker (or is the marker)
       top = marker
       while top && top.parent && top.parent != body
         top = top.parent
@@ -144,28 +147,19 @@ after_initialize do
 
       Nokogiri::HTML(parts.join("\n"))
     rescue
-      doc # fail-open: if boundary logic fails, behave as before
+      doc # fail-open: behave as before
     end
 
     # ============================================================
-    # Count topics (HTML + TEXT) so we can skip trimming for 1-topic digests
-    # Count ONLY BEFORE "Popular Posts"
+    # Topic counting (BEFORE "Popular Posts") by UNIQUE topic_id
     # ============================================================
 
-    def self.count_topics_in_html_doc(doc)
-      scope = scoped_doc_before_popular(doc)
+    def self.extract_topic_id_from_href(href, base)
+      h = href.to_s
+      return nil if h.empty?
+      return nil unless h.include?("/t/")
 
-      nodes =
-        HTML_EXCERPT_SELECTORS
-          .flat_map { |sel| scope.css(sel).to_a }
-          .uniq
-
-      return nodes.size if nodes.size > 0
-
-      # Fallback: count distinct internal /t/ links (only in scoped content)
-      base = Discourse.base_url
-      links = scope.css("a[href]").map { |a| a["href"].to_s }.select { |h| h.include?("/t/") }
-      links = links.map do |h|
+      path =
         if h.start_with?("/")
           h
         elsif h.start_with?(base)
@@ -173,56 +167,76 @@ after_initialize do
         else
           h
         end
-      end
-      links.uniq.size
+
+      m = path.match(%r{/t/(?:[^/]+/)?(\d+)}i)
+      m ? m[1] : nil
+    rescue
+      nil
+    end
+
+    def self.count_topics_in_html_doc(doc)
+      scope = scoped_doc_before_popular(doc)
+      base = Discourse.base_url
+
+      ids =
+        scope
+          .css("a[href]")
+          .map { |a| extract_topic_id_from_href(a["href"], base) }
+          .compact
+          .uniq
+
+      ids.size
     rescue
       999 # fail-open: do NOT accidentally skip trimming
     end
 
     def self.count_topics_in_text_blocks(blocks)
-      # Only count topic URLs in blocks BEFORE "Popular Posts" section.
       cutoff = blocks.find_index do |b|
         t = normalize_spaces(b).downcase
         POPULAR_POSTS_MARKERS.any? { |m| t.include?(m) }
       end
 
-      scoped = cutoff ? blocks[0...cutoff] : blocks
-      scoped.count { |b| b.to_s =~ TEXT_TOPIC_URL_REGEX }
+      scoped_text = cutoff ? blocks[0...cutoff].join("\n\n") : blocks.join("\n\n")
+      ids = scoped_text.scan(%r{/t/(?:[^/\s]+/)?(\d+)}i).flatten.uniq
+      ids.size
     rescue
       999 # fail-open
     end
 
     # ============================================================
-    # HTML: trim in-place by editing text nodes (preserves <p> spacing)
+    # HTML: trim in-place FORWARD (keeps early paragraphs), then cuts once
     # ============================================================
 
     def self.trim_html_node_in_place!(node, max_chars)
-      full = node.text.to_s
-      full_norm = normalize_spaces(full)
+      full_norm = normalize_spaces(node.text.to_s)
       return false if full_norm.length <= max_chars
 
       text_nodes = node.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]").to_a
       return false if text_nodes.empty?
 
-      remaining = full_norm.length
+      budget = max_chars
+      trimming_started = false
 
-      text_nodes.reverse_each do |tn|
-        t = tn.text.to_s
-        t_norm = normalize_spaces(t)
-        next if t_norm.empty?
+      text_nodes.each_with_index do |tn, idx|
+        raw = tn.text.to_s
+        norm = normalize_spaces(raw)
+        next if norm.empty?
 
-        break if remaining <= max_chars
+        if !trimming_started
+          if norm.length <= budget
+            budget -= norm.length
+            next
+          end
 
-        over = remaining - max_chars
+          # Cut inside THIS node (keeps earlier content + adds ellipsis)
+          tn.content = smart_trim_plain(raw, budget)
+          trimming_started = true
 
-        if t_norm.length <= over
-          tn.remove
-          remaining -= t_norm.length
-        else
-          new_text = smart_trim_plain(t_norm, (t_norm.length - over))
-          tn.content = new_text
-          remaining = max_chars
+          # Remove all remaining text nodes AFTER this one
+          text_nodes[(idx + 1)..-1].to_a.each(&:remove)
           break
+        else
+          tn.remove
         end
       end
 
@@ -320,7 +334,7 @@ after_initialize do
         end
       end
 
-      # If only one topic exists BEFORE "Popular Posts", skip excerpt trimming
+      # If only one UNIQUE topic_id exists BEFORE "Popular Posts", skip excerpt trimming
       if ENABLE_TRIM_HTML_PART
         topic_count = count_topics_in_html_doc(doc)
         do_trim = topic_count > 1
@@ -387,7 +401,7 @@ after_initialize do
       t = text.to_s.gsub(/\r\n?/, "\n")
       blocks = t.split(/\n{2,}/)
 
-      # If only one topic exists BEFORE "Popular Posts", skip text excerpt trimming entirely
+      # If only one UNIQUE topic_id exists BEFORE "Popular Posts", skip text excerpt trimming entirely
       topic_count = count_topics_in_text_blocks(blocks)
       return if topic_count <= 1
 
