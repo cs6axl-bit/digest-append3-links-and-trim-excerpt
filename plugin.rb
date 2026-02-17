@@ -3,6 +3,7 @@
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
 #        HTML trim now preserves existing markup/spacing by trimming text nodes in-place (no wiping children).
+#        NEW: If only ONE topic exists in the digest email, excerpt trimming is skipped (HTML + TEXT).
 
 after_initialize do
   require_dependency "user_notifications"
@@ -98,46 +99,68 @@ after_initialize do
     end
 
     # ============================================================
+    # Count topics (HTML + TEXT) so we can skip trimming for 1-topic digests
+    # ============================================================
+
+    def self.count_topics_in_html_doc(doc)
+      nodes =
+        HTML_EXCERPT_SELECTORS
+          .flat_map { |sel| doc.css(sel).to_a }
+          .uniq
+
+      return nodes.size if nodes.size > 0
+
+      # Fallback: count distinct internal /t/ links
+      base = Discourse.base_url
+      links = doc.css("a[href]").map { |a| a["href"].to_s }.select { |h| h.include?("/t/") }
+      links = links.map do |h|
+        if h.start_with?("/")
+          h
+        elsif h.start_with?(base)
+          h.sub(base, "")
+        else
+          h
+        end
+      end
+      links.uniq.size
+    rescue
+      999 # fail-open: do NOT accidentally skip trimming
+    end
+
+    def self.count_topics_in_text_blocks(blocks)
+      blocks.count { |b| b.to_s =~ TEXT_TOPIC_URL_REGEX }
+    rescue
+      999 # fail-open
+    end
+
+    # ============================================================
     # HTML: trim in-place by editing text nodes (preserves <p> spacing)
     # ============================================================
 
     def self.trim_html_node_in_place!(node, max_chars)
-      # total visible text
       full = node.text.to_s
       full_norm = normalize_spaces(full)
       return false if full_norm.length <= max_chars
 
-      # Gather ALL text nodes under this node (excluding script/style)
       text_nodes = node.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]").to_a
       return false if text_nodes.empty?
 
-      # We trim from the end backwards until within limit
       remaining = full_norm.length
 
-      # To avoid expensive re-normalization each time, we approximate per-node lengths by normalized text.
-      # This is fine for email excerpts (mostly plain).
       text_nodes.reverse_each do |tn|
         t = tn.text.to_s
         t_norm = normalize_spaces(t)
         next if t_norm.empty?
 
-        if remaining <= max_chars
-          break
-        end
+        break if remaining <= max_chars
 
         over = remaining - max_chars
 
         if t_norm.length <= over
-          # remove this text node entirely
           tn.remove
           remaining -= t_norm.length
         else
-          # shorten this node and finish
-          new_text = smart_trim_plain(t_norm, t_norm.length - over)
-          # Ensure ellipsis only once at the very end
-          new_text = new_text.sub(/…+$/, "") # strip existing ellipsis from smart trim
           new_text = smart_trim_plain(t_norm, (t_norm.length - over))
-          # smart_trim_plain already adds "…"
           tn.content = new_text
           remaining = max_chars
           break
@@ -169,7 +192,6 @@ after_initialize do
 
       base = Discourse.base_url
 
-      # Cheap skip if no work
       if ENABLE_LINK_REWRITE && !body.include?('href="') && !body.include?("href='")
         return unless ENABLE_TRIM_HTML_PART
       end
@@ -181,7 +203,6 @@ after_initialize do
       end
 
       if !Nokogiri
-        # Regex rewrite only; skip HTML trimming
         if ENABLE_LINK_REWRITE
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
@@ -224,6 +245,8 @@ after_initialize do
             added = true
           end
           if !dayofweek_val.empty? && !params.any? { |k, _| k == "dayofweek" }
+            params << ["dayofweek"] << dayofweek_val
+            params.pop # remove nested
             params << ["dayofweek", dayofweek_val]
             added = true
           end
@@ -240,23 +263,28 @@ after_initialize do
         end
       end
 
+      # NEW: if only one topic exists, skip excerpt trimming
       if ENABLE_TRIM_HTML_PART
-        nodes =
-          HTML_EXCERPT_SELECTORS
-            .flat_map { |sel| doc.css(sel).to_a }
-            .uniq
+        topic_count = count_topics_in_html_doc(doc)
+        do_trim = topic_count > 1
 
-        nodes.each do |node|
-          # Never trim if node contains unsubscribe/preferences links
-          begin
-            hrefs = node.css("a[href]").map { |x| x["href"].to_s }
-            next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
-          rescue
-            next
-          end
+        if do_trim
+          nodes =
+            HTML_EXCERPT_SELECTORS
+              .flat_map { |sel| doc.css(sel).to_a }
+              .uniq
 
-          if trim_html_node_in_place!(node, HTML_MAX_CHARS)
-            changed = true
+          nodes.each do |node|
+            begin
+              hrefs = node.css("a[href]").map { |x| x["href"].to_s }
+              next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
+            rescue
+              next
+            end
+
+            if trim_html_node_in_place!(node, HTML_MAX_CHARS)
+              changed = true
+            end
           end
         end
       end
@@ -301,6 +329,10 @@ after_initialize do
 
       t = text.to_s.gsub(/\r\n?/, "\n")
       blocks = t.split(/\n{2,}/)
+
+      # NEW: if only one topic exists, skip text excerpt trimming entirely
+      topic_count = count_topics_in_text_blocks(blocks)
+      return if topic_count <= 1
 
       changed = false
 
