@@ -1,9 +1,9 @@
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.1
+# version: 1.2
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
-#        HTML trim now preserves existing markup/spacing by trimming text nodes in-place (no wiping children).
-#        NEW: If only ONE topic exists in the digest email, excerpt trimming is skipped (HTML + TEXT).
+#        HTML trim preserves markup by trimming text nodes in-place (no wiping children).
+#        If only ONE topic exists *before* the "Popular Posts" section, excerpt trimming is skipped (HTML + TEXT).
 
 after_initialize do
   require_dependency "user_notifications"
@@ -49,6 +49,12 @@ after_initialize do
       "/email/unsubscribe",
       "preferences",
       "/my/preferences"
+    ]
+
+    # Heading text that marks the start of the "Popular Posts" section.
+    POPULAR_POSTS_MARKERS = [
+      "popular posts",
+      "popular topics"
     ]
 
     # ============================================================
@@ -99,20 +105,66 @@ after_initialize do
     end
 
     # ============================================================
+    # "Popular Posts" boundary helpers
+    # ============================================================
+
+    def self.node_text_matches_popular?(node)
+      t = normalize_spaces(node&.text).downcase
+      return false if t.empty?
+      POPULAR_POSTS_MARKERS.any? { |m| t.include?(m) }
+    rescue
+      false
+    end
+
+    def self.scoped_doc_before_popular(doc)
+      return doc unless doc
+
+      # Find a "Popular Posts" marker node (often in a heading/strong/td/etc)
+      marker =
+        doc.css("h1,h2,h3,h4,h5,h6,strong,b,td,th,p,div,span").find do |n|
+          node_text_matches_popular?(n)
+        end
+
+      return doc unless marker
+
+      body = doc.at("body")
+      return doc unless body
+
+      # Build HTML containing only body children BEFORE the marker's top-level ancestor under body.
+      top = marker
+      while top && top.parent && top.parent != body
+        top = top.parent
+      end
+
+      parts = []
+      body.children.each do |child|
+        break if child == top
+        parts << child.to_html
+      end
+
+      Nokogiri::HTML(parts.join("\n"))
+    rescue
+      doc # fail-open: if boundary logic fails, behave as before
+    end
+
+    # ============================================================
     # Count topics (HTML + TEXT) so we can skip trimming for 1-topic digests
+    # Count ONLY BEFORE "Popular Posts"
     # ============================================================
 
     def self.count_topics_in_html_doc(doc)
+      scope = scoped_doc_before_popular(doc)
+
       nodes =
         HTML_EXCERPT_SELECTORS
-          .flat_map { |sel| doc.css(sel).to_a }
+          .flat_map { |sel| scope.css(sel).to_a }
           .uniq
 
       return nodes.size if nodes.size > 0
 
-      # Fallback: count distinct internal /t/ links
+      # Fallback: count distinct internal /t/ links (only in scoped content)
       base = Discourse.base_url
-      links = doc.css("a[href]").map { |a| a["href"].to_s }.select { |h| h.include?("/t/") }
+      links = scope.css("a[href]").map { |a| a["href"].to_s }.select { |h| h.include?("/t/") }
       links = links.map do |h|
         if h.start_with?("/")
           h
@@ -128,7 +180,14 @@ after_initialize do
     end
 
     def self.count_topics_in_text_blocks(blocks)
-      blocks.count { |b| b.to_s =~ TEXT_TOPIC_URL_REGEX }
+      # Only count topic URLs in blocks BEFORE "Popular Posts" section.
+      cutoff = blocks.find_index do |b|
+        t = normalize_spaces(b).downcase
+        POPULAR_POSTS_MARKERS.any? { |m| t.include?(m) }
+      end
+
+      scoped = cutoff ? blocks[0...cutoff] : blocks
+      scoped.count { |b| b.to_s =~ TEXT_TOPIC_URL_REGEX }
     rescue
       999 # fail-open
     end
@@ -245,8 +304,6 @@ after_initialize do
             added = true
           end
           if !dayofweek_val.empty? && !params.any? { |k, _| k == "dayofweek" }
-            params << ["dayofweek"] << dayofweek_val
-            params.pop # remove nested
             params << ["dayofweek", dayofweek_val]
             added = true
           end
@@ -263,7 +320,7 @@ after_initialize do
         end
       end
 
-      # NEW: if only one topic exists, skip excerpt trimming
+      # If only one topic exists BEFORE "Popular Posts", skip excerpt trimming
       if ENABLE_TRIM_HTML_PART
         topic_count = count_topics_in_html_doc(doc)
         do_trim = topic_count > 1
@@ -330,7 +387,7 @@ after_initialize do
       t = text.to_s.gsub(/\r\n?/, "\n")
       blocks = t.split(/\n{2,}/)
 
-      # NEW: if only one topic exists, skip text excerpt trimming entirely
+      # If only one topic exists BEFORE "Popular Posts", skip text excerpt trimming entirely
       topic_count = count_topics_in_text_blocks(blocks)
       return if topic_count <= 1
 
