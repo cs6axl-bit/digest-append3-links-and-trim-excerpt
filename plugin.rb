@@ -1,6 +1,7 @@
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.3
+# version: 1.4
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
+#        PLUS (v1.4): Rewrites ALL EXTERNAL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
 #        HTML trim preserves markup by trimming text nodes in-place.
 #        NEW (v1.2): Count topics ONLY before "Popular Posts" section.
@@ -26,6 +27,11 @@ after_initialize do
     # ============================================================
 
     ENABLE_LINK_REWRITE = true
+
+    # NEW (v1.4): rewrite links inside post bodies (excerpts) to /content?u=<base64url(url)>
+    ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS = true
+    CONTENT_REDIRECTOR_PATH = "/content"
+    CONTENT_REDIRECTOR_PARAM = "u"
 
     ENABLE_TRIM_HTML_PART = true
     HTML_MAX_CHARS        = 300
@@ -106,6 +112,32 @@ after_initialize do
         cut = cut[0, idx]
       end
       cut.rstrip + "…"
+    end
+
+    def self.base64url_encode(s)
+      Base64.urlsafe_encode64(s.to_s, padding: false)
+    rescue
+      ""
+    end
+
+    def self.make_content_redirector_url(final_url, base)
+      token = base64url_encode(final_url)
+      return nil if token.to_s.empty?
+      "#{base}#{CONTENT_REDIRECTOR_PATH}?#{CONTENT_REDIRECTOR_PARAM}=#{token}"
+    end
+
+    def self.absolute_url_from_href(href, base)
+      h = href.to_s.strip
+      return nil if h.empty?
+      return (base + h) if h.start_with?("/")
+      return h
+    end
+
+    def self.http_url?(url)
+      u = URI.parse(url)
+      u.is_a?(URI::HTTP) || u.is_a?(URI::HTTPS)
+    rescue
+      false
     end
 
     # ============================================================
@@ -276,6 +308,7 @@ after_initialize do
       end
 
       if !Nokogiri
+        # keep your old fallback (no /content rewrite here)
         if ENABLE_LINK_REWRITE
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
@@ -286,6 +319,7 @@ after_initialize do
       doc = Nokogiri::HTML(body)
       changed = false
 
+      # 1) rewrite INTERNAL links (as before): add isdigest/u/dayofweek/email_id
       if ENABLE_LINK_REWRITE
         doc.css("a[href]").each do |a|
           href = a["href"].to_s.strip
@@ -331,6 +365,51 @@ after_initialize do
           uri.query = URI.encode_www_form(params)
           a["href"] = uri.to_s
           changed = true
+        end
+      end
+
+      # 2) NEW: rewrite ALL links INSIDE excerpt bodies to /content?u=<base64url(final_url)>
+      if ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
+        excerpt_nodes =
+          HTML_EXCERPT_SELECTORS
+            .flat_map { |sel| doc.css(sel).to_a }
+            .uniq
+
+        if excerpt_nodes.any?
+          excerpt_nodes.each do |node|
+            node.css("a[href]").each do |a|
+              href = a["href"].to_s.strip
+              next if href.empty?
+              next if href.start_with?("mailto:", "tel:", "sms:", "#")
+              next if contains_any?(href, NEVER_TOUCH_HREF_SUBSTRINGS)
+
+              # don't double-wrap already wrapped /content
+              begin
+                abs0 = absolute_url_from_href(href, base)
+              rescue
+                next
+              end
+              next if abs0.nil?
+              next unless http_url?(abs0)
+
+              # skip if it's already /content
+              begin
+                u0 = URI.parse(abs0)
+                if u0.host == URI.parse(base).host && u0.path == CONTENT_REDIRECTOR_PATH
+                  next
+                end
+              rescue
+                # ignore
+              end
+
+              # IMPORTANT: use the FINAL URL currently in href (which may already include isdigest/u/dayofweek/email_id for internal)
+              redirect_abs = make_content_redirector_url(abs0, base)
+              next if redirect_abs.nil?
+
+              a["href"] = redirect_abs
+              changed = true
+            end
+          end
         end
       end
 
