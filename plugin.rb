@@ -1,5 +1,7 @@
+# frozen_string_literal: true
+
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.4
+# version: 1.5
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL EXTERNAL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
@@ -8,6 +10,12 @@
 #        NEW (v1.3): Count topics by UNIQUE topic_id (from /t/.../<id>) to avoid overcount when one topic renders multiple excerpt blocks.
 #        NEW (v1.3): HTML trimming now trims FORWARD (keeps early paragraphs), not reverse-deleting later nodes.
 #        NEW (v1.3): normalize_spaces collapses ALL whitespace so we don't cut early at line breaks.
+#        NEW (v1.5): FIX topic counting: no longer relies solely on /t/... links (tracked links break it).
+#                  - "Popular Posts" boundary detection tightened (headings/strong only; must be a likely header)
+#                  - Topic counting now:
+#                      1) tries data-topic-id in scoped doc
+#                      2) tries /t/.../<id> in hrefs
+#                      3) FALLBACK: counts excerpt nodes (what you actually trim) in scoped doc
 
 after_initialize do
   require_dependency "user_notifications"
@@ -28,7 +36,7 @@ after_initialize do
 
     ENABLE_LINK_REWRITE = true
 
-    # NEW (v1.4): rewrite links inside post bodies (excerpts) to /content?u=<base64url(url)>
+    # rewrite links inside post bodies (excerpts) to /content?u=<base64url(url)>
     ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS = true
     CONTENT_REDIRECTOR_PATH = "/content"
     CONTENT_REDIRECTOR_PARAM = "u"
@@ -65,6 +73,9 @@ after_initialize do
       "popular posts",
       "popular topics"
     ]
+
+    # v1.5: tighten boundary detection so we don’t accidentally match random body text
+    POPULAR_MARKER_TAGS = "h1,h2,h3,h4,h5,h6,strong,b"
 
     # ============================================================
     # Hook
@@ -130,7 +141,7 @@ after_initialize do
       h = href.to_s.strip
       return nil if h.empty?
       return (base + h) if h.start_with?("/")
-      return h
+      h
     end
 
     def self.http_url?(url)
@@ -152,12 +163,19 @@ after_initialize do
       false
     end
 
+    # v1.5: scoped doc is ONLY before a likely section header for Popular Posts.
     def self.scoped_doc_before_popular(doc)
       return doc unless doc
 
       marker =
-        doc.css("h1,h2,h3,h4,h5,h6,strong,b,td,th,p,div,span").find do |n|
-          node_text_matches_popular?(n)
+        doc.css(POPULAR_MARKER_TAGS).find do |n|
+          next false unless node_text_matches_popular?(n)
+
+          # Avoid matching long paragraphs that happen to mention the words.
+          # We expect section headers to be short-ish.
+          txt = normalize_spaces(n.text)
+          txt_len = txt.length
+          txt_len > 0 && txt_len <= 60
         end
 
       return doc unless marker
@@ -179,11 +197,11 @@ after_initialize do
 
       Nokogiri::HTML(parts.join("\n"))
     rescue
-      doc # fail-open: behave as before
+      doc # fail-open
     end
 
     # ============================================================
-    # Topic counting (BEFORE "Popular Posts") by UNIQUE topic_id
+    # Topic counting (BEFORE "Popular Posts") - v1.5 robust
     # ============================================================
 
     def self.extract_topic_id_from_href(href, base)
@@ -208,16 +226,39 @@ after_initialize do
 
     def self.count_topics_in_html_doc(doc)
       scope = scoped_doc_before_popular(doc)
+
       base = Discourse.base_url
 
-      ids =
+      # (1) Best: data-topic-id exists in many digest templates
+      ids1 =
+        scope
+          .css("[data-topic-id]")
+          .map { |n| n["data-topic-id"].to_s.strip }
+          .reject(&:empty?)
+          .uniq
+
+      return ids1.size if ids1.size > 1
+
+      # (2) Next: /t/.../<id> links (works when not tracked/redirected)
+      ids2 =
         scope
           .css("a[href]")
           .map { |a| extract_topic_id_from_href(a["href"], base) }
           .compact
           .uniq
 
-      ids.size
+      return ids2.size if ids2.size > 1
+
+      # (3) Fallback: count excerpt nodes (this matches what you *actually* trim)
+      excerpt_nodes =
+        HTML_EXCERPT_SELECTORS
+          .flat_map { |sel| scope.css(sel).to_a }
+          .uniq
+
+      return excerpt_nodes.size if excerpt_nodes.size > 1
+
+      # If we got here, we truly couldn't observe multiple topics
+      [ids1.size, ids2.size, excerpt_nodes.size].max
     rescue
       999 # fail-open: do NOT accidentally skip trimming
     end
@@ -230,6 +271,13 @@ after_initialize do
 
       scoped_text = cutoff ? blocks[0...cutoff].join("\n\n") : blocks.join("\n\n")
       ids = scoped_text.scan(%r{/t/(?:[^/\s]+/)?(\d+)}i).flatten.uniq
+
+      # fallback: if we can’t find ids but there are multiple “topic URL” blocks, treat as multiple
+      return ids.size if ids.size > 1
+
+      topic_url_blocks = (cutoff ? blocks[0...cutoff] : blocks).count { |b| b.to_s =~ TEXT_TOPIC_URL_REGEX }
+      return topic_url_blocks if topic_url_blocks > 1
+
       ids.size
     rescue
       999 # fail-open
@@ -308,7 +356,7 @@ after_initialize do
       end
 
       if !Nokogiri
-        # keep your old fallback (no /content rewrite here)
+        # fallback (no /content rewrite here)
         if ENABLE_LINK_REWRITE
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
@@ -319,7 +367,7 @@ after_initialize do
       doc = Nokogiri::HTML(body)
       changed = false
 
-      # 1) rewrite INTERNAL links (as before): add isdigest/u/dayofweek/email_id
+      # 1) rewrite INTERNAL links: add isdigest/u/dayofweek/email_id
       if ENABLE_LINK_REWRITE
         doc.css("a[href]").each do |a|
           href = a["href"].to_s.strip
@@ -368,7 +416,7 @@ after_initialize do
         end
       end
 
-      # 2) NEW: rewrite ALL links INSIDE excerpt bodies to /content?u=<base64url(final_url)>
+      # 2) rewrite ALL links INSIDE excerpt bodies to /content?u=<base64url(final_url)>
       if ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
         excerpt_nodes =
           HTML_EXCERPT_SELECTORS
@@ -383,12 +431,7 @@ after_initialize do
               next if href.start_with?("mailto:", "tel:", "sms:", "#")
               next if contains_any?(href, NEVER_TOUCH_HREF_SUBSTRINGS)
 
-              # don't double-wrap already wrapped /content
-              begin
-                abs0 = absolute_url_from_href(href, base)
-              rescue
-                next
-              end
+              abs0 = absolute_url_from_href(href, base)
               next if abs0.nil?
               next unless http_url?(abs0)
 
@@ -402,7 +445,6 @@ after_initialize do
                 # ignore
               end
 
-              # IMPORTANT: use the FINAL URL currently in href (which may already include isdigest/u/dayofweek/email_id for internal)
               redirect_abs = make_content_redirector_url(abs0, base)
               next if redirect_abs.nil?
 
@@ -413,7 +455,7 @@ after_initialize do
         end
       end
 
-      # If only one UNIQUE topic_id exists BEFORE "Popular Posts", skip excerpt trimming
+      # If only one UNIQUE topic exists BEFORE "Popular Posts", skip excerpt trimming
       if ENABLE_TRIM_HTML_PART
         topic_count = count_topics_in_html_doc(doc)
         do_trim = topic_count > 1
@@ -480,7 +522,7 @@ after_initialize do
       t = text.to_s.gsub(/\r\n?/, "\n")
       blocks = t.split(/\n{2,}/)
 
-      # If only one UNIQUE topic_id exists BEFORE "Popular Posts", skip text excerpt trimming entirely
+      # If only one UNIQUE topic exists BEFORE "Popular Posts", skip text excerpt trimming entirely
       topic_count = count_topics_in_text_blocks(blocks)
       return if topic_count <= 1
 
