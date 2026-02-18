@@ -1,23 +1,14 @@
-# frozen_string_literal: true
-
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.8
+# version: 1.5
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
-#        PLUS (v1.4): Rewrites ALL EXTERNAL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
+#        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
+#        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
 #        HTML trim preserves markup by trimming text nodes in-place.
-#        NEW (v1.2): Count topics ONLY before "Popular Posts" section.
-#        NEW (v1.3): Count topics by UNIQUE topic_id (from /t/.../<id>) to avoid overcount when one topic renders multiple excerpt blocks.
-#        NEW (v1.3): HTML trimming now trims FORWARD (keeps early paragraphs), not reverse-deleting later nodes.
-#        NEW (v1.3): normalize_spaces collapses ALL whitespace so we don't cut early at line breaks.
-#        NEW (v1.5): FIX topic counting: no longer relies solely on /t/... links (tracked links break it).
-#                  - "Popular Posts" boundary detection tightened (headings/strong only; must be a likely header)
-#        NEW (v1.6): FIX trimming when only ONE topic exists:
-#                  - If topic ids are observed (data-topic-id OR /t/.../<id>), treat count>=1 as definitive.
-#                  - Fallback excerpt-node counting only used when NO topic ids are found.
-#                  - If excerpt nodes exist but no ids, assume 1 topic.
-#        NEW (v1.7): Added option to remove ALL DOM after cut point (removes trailing images/elements).
-#        NEW (v1.8): Make trailing-image removal optional via switch.
+#        Count topics ONLY before "Popular Posts" section.
+#        Count topics by UNIQUE topic_id (from /t/.../<id>) to avoid overcount when one topic renders multiple excerpt blocks.
+#        HTML trimming trims FORWARD (keeps early paragraphs), not reverse-deleting later nodes.
+#        normalize_spaces collapses ALL whitespace so we don't cut early at line breaks.
 
 after_initialize do
   require_dependency "user_notifications"
@@ -38,7 +29,7 @@ after_initialize do
 
     ENABLE_LINK_REWRITE = true
 
-    # rewrite links inside post bodies (excerpts) to /content?u=<base64url(url)>
+    # Rewrite links inside post bodies (excerpts) to /content?u=<base64url(url)>
     ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS = true
     CONTENT_REDIRECTOR_PATH = "/content"
     CONTENT_REDIRECTOR_PARAM = "u"
@@ -48,12 +39,6 @@ after_initialize do
 
     ENABLE_TRIM_TEXT_PART = true
     TEXT_MAX_CHARS        = 300
-
-    # NEW (v1.8):
-    # If true: when we cut inside an excerpt, delete ALL nodes that come after the cut point
-    #          (this removes trailing <img>/<figure>/<picture>/etc).
-    # If false: only text nodes are removed (images/elements after the cut may remain).
-    ENABLE_REMOVE_TRAILING_ELEMENTS_AFTER_CUT = true
 
     HTML_EXCERPT_SELECTORS = [
       ".digest-post-excerpt",
@@ -81,9 +66,6 @@ after_initialize do
       "popular posts",
       "popular topics"
     ]
-
-    # v1.5: tighten boundary detection so we don’t accidentally match random body text
-    POPULAR_MARKER_TAGS = "h1,h2,h3,h4,h5,h6,strong,b"
 
     # ============================================================
     # Hook
@@ -159,6 +141,16 @@ after_initialize do
       false
     end
 
+    # If only one topic header exists in the digest (p.digest-topic-name),
+    # skip excerpt trimming entirely.
+    def self.only_one_digest_topic_name?(doc)
+      return false unless doc
+      nodes = doc.css("p.digest-topic-name")
+      nodes && nodes.size == 1
+    rescue
+      false
+    end
+
     # ============================================================
     # "Popular Posts" boundary helpers
     # ============================================================
@@ -171,19 +163,12 @@ after_initialize do
       false
     end
 
-    # v1.5: scoped doc is ONLY before a likely section header for Popular Posts.
     def self.scoped_doc_before_popular(doc)
       return doc unless doc
 
       marker =
-        doc.css(POPULAR_MARKER_TAGS).find do |n|
-          next false unless node_text_matches_popular?(n)
-
-          # Avoid matching long paragraphs that happen to mention the words.
-          # We expect section headers to be short-ish.
-          txt = normalize_spaces(n.text)
-          txt_len = txt.length
-          txt_len > 0 && txt_len <= 60
+        doc.css("h1,h2,h3,h4,h5,h6,strong,b,td,th,p,div,span").find do |n|
+          node_text_matches_popular?(n)
         end
 
       return doc unless marker
@@ -205,11 +190,11 @@ after_initialize do
 
       Nokogiri::HTML(parts.join("\n"))
     rescue
-      doc # fail-open
+      doc # fail-open: behave as before
     end
 
     # ============================================================
-    # Topic counting (BEFORE "Popular Posts") - robust (v1.6+)
+    # Topic counting (BEFORE "Popular Posts") by UNIQUE topic_id
     # ============================================================
 
     def self.extract_topic_id_from_href(href, base)
@@ -236,36 +221,14 @@ after_initialize do
       scope = scoped_doc_before_popular(doc)
       base = Discourse.base_url
 
-      # (1) Best: data-topic-id exists in many digest templates
-      ids1 =
-        scope
-          .css("[data-topic-id]")
-          .map { |n| n["data-topic-id"].to_s.strip }
-          .reject(&:empty?)
-          .uniq
-
-      return ids1.size if ids1.size >= 1
-
-      # (2) Next: /t/.../<id> links (works when not tracked/redirected)
-      ids2 =
+      ids =
         scope
           .css("a[href]")
           .map { |a| extract_topic_id_from_href(a["href"], base) }
           .compact
           .uniq
 
-      return ids2.size if ids2.size >= 1
-
-      # (3) Fallback ONLY when no ids found:
-      excerpt_nodes =
-        HTML_EXCERPT_SELECTORS
-          .flat_map { |sel| scope.css(sel).to_a }
-          .uniq
-
-      # Multiple excerpt blocks can still be ONE topic -> assume 1 if any exist
-      return 1 if excerpt_nodes.size >= 1
-
-      0
+      ids.size
     rescue
       999 # fail-open: do NOT accidentally skip trimming
     end
@@ -278,45 +241,9 @@ after_initialize do
 
       scoped_text = cutoff ? blocks[0...cutoff].join("\n\n") : blocks.join("\n\n")
       ids = scoped_text.scan(%r{/t/(?:[^/\s]+/)?(\d+)}i).flatten.uniq
-
-      # if we observe ANY topic ids, that is definitive (1 => 1)
-      return ids.size if ids.size >= 1
-
-      # fallback: if we can’t find ids but there are multiple “topic URL” blocks, treat as multiple
-      topic_url_blocks = (cutoff ? blocks[0...cutoff] : blocks).count { |b| b.to_s =~ TEXT_TOPIC_URL_REGEX }
-      return topic_url_blocks if topic_url_blocks > 1
-
-      0
+      ids.size
     rescue
       999 # fail-open
-    end
-
-    # ============================================================
-    # Optional: remove EVERYTHING after cut point (elements too)
-    # ============================================================
-
-    def self.remove_everything_after_point!(container_node, point_node)
-      return if container_node.nil? || point_node.nil?
-
-      cur = point_node
-
-      # Walk upward toward container_node.
-      # At each level, remove all siblings AFTER the current node.
-      while cur && cur != container_node
-        parent = cur.parent
-        break if parent.nil?
-
-        sib = cur.next_sibling
-        while sib
-          nxt = sib.next_sibling
-          sib.remove
-          sib = nxt
-        end
-
-        cur = parent
-      end
-    rescue
-      nil
     end
 
     # ============================================================
@@ -348,14 +275,8 @@ after_initialize do
           tn.content = smart_trim_plain(raw, budget)
           trimming_started = true
 
-          if ENABLE_REMOVE_TRAILING_ELEMENTS_AFTER_CUT
-            # Remove ALL DOM after cut point (images/elements too)
-            remove_everything_after_point!(node, tn)
-          else
-            # Legacy behavior: only remove remaining TEXT nodes (images/elements may remain)
-            text_nodes[(idx + 1)..-1].to_a.each(&:remove)
-          end
-
+          # Remove all remaining text nodes AFTER this one
+          text_nodes[(idx + 1)..-1].to_a.each(&:remove)
           break
         else
           tn.remove
@@ -392,13 +313,13 @@ after_initialize do
       end
 
       if ENABLE_TRIM_HTML_PART
-        selector_hints = ["digest-post-excerpt", "post-excerpt", "topic-excerpt", "itemprop=\"articleBody\"", "itemprop='articleBody'", "excerpt"]
+        selector_hints = ["digest-post-excerpt", "post-excerpt", "topic-excerpt", "itemprop=\"articleBody\"", "itemprop='articleBody'", "excerpt", "digest-topic-name"]
         has_trim_hint = selector_hints.any? { |h| body.include?(h) }
         return if !has_trim_hint && !ENABLE_LINK_REWRITE
       end
 
       if !Nokogiri
-        # fallback (no /content rewrite here)
+        # keep your old fallback (no /content rewrite here)
         if ENABLE_LINK_REWRITE
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
@@ -409,7 +330,7 @@ after_initialize do
       doc = Nokogiri::HTML(body)
       changed = false
 
-      # 1) rewrite INTERNAL links: add isdigest/u/dayofweek/email_id
+      # 1) rewrite INTERNAL links (as before): add isdigest/u/dayofweek/email_id
       if ENABLE_LINK_REWRITE
         doc.css("a[href]").each do |a|
           href = a["href"].to_s.strip
@@ -480,7 +401,8 @@ after_initialize do
               # skip if it's already /content
               begin
                 u0 = URI.parse(abs0)
-                if u0.host == URI.parse(base).host && u0.path == CONTENT_REDIRECTOR_PATH
+                b0 = URI.parse(base)
+                if u0.host == b0.host && u0.path == CONTENT_REDIRECTOR_PATH
                   next
                 end
               rescue
@@ -497,27 +419,33 @@ after_initialize do
         end
       end
 
-      # If only one UNIQUE topic exists BEFORE "Popular Posts", skip excerpt trimming
+      # 3) HTML excerpt trimming
       if ENABLE_TRIM_HTML_PART
-        topic_count = count_topics_in_html_doc(doc)
-        do_trim = topic_count > 1
+        # NEW: If only one digest topic name exists, skip trimming entirely.
+        skip_trim = only_one_digest_topic_name?(doc)
 
-        if do_trim
-          nodes =
-            HTML_EXCERPT_SELECTORS
-              .flat_map { |sel| doc.css(sel).to_a }
-              .uniq
+        unless skip_trim
+          # Keep prior logic too: if only one UNIQUE topic_id exists BEFORE "Popular Posts", skip trimming
+          topic_count = count_topics_in_html_doc(doc)
+          do_trim = topic_count > 1
 
-          nodes.each do |node|
-            begin
-              hrefs = node.css("a[href]").map { |x| x["href"].to_s }
-              next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
-            rescue
-              next
-            end
+          if do_trim
+            nodes =
+              HTML_EXCERPT_SELECTORS
+                .flat_map { |sel| doc.css(sel).to_a }
+                .uniq
 
-            if trim_html_node_in_place!(node, HTML_MAX_CHARS)
-              changed = true
+            nodes.each do |node|
+              begin
+                hrefs = node.css("a[href]").map { |x| x["href"].to_s }
+                next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
+              rescue
+                next
+              end
+
+              if trim_html_node_in_place!(node, HTML_MAX_CHARS)
+                changed = true
+              end
             end
           end
         end
@@ -564,7 +492,7 @@ after_initialize do
       t = text.to_s.gsub(/\r\n?/, "\n")
       blocks = t.split(/\n{2,}/)
 
-      # If only one UNIQUE topic exists BEFORE "Popular Posts", skip text excerpt trimming entirely
+      # If only one UNIQUE topic_id exists BEFORE "Popular Posts", skip text excerpt trimming entirely
       topic_count = count_topics_in_text_blocks(blocks)
       return if topic_count <= 1
 
