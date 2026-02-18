@@ -1,13 +1,14 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.7.1
+# version: 1.7.6
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
 #        FIX  (v1.6): Topic counting computed BEFORE /content rewrites; Popular Posts boundary uses document order (robust even if whole email is one big table).
 #        PLUS (v1.7): Trim to MIN(max_chars, first visual line break).
 #        FIX  (v1.7.1): Line-break trimming now RESPECTS ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES (keep images/objects when false).
+#        PLUS (v1.7.6): For /content rewrite (post-body links), append aff_sub2 and subid where value is "#{user_id}-#{topic_id_of_current_digest_topic}" (topic id derived from surrounding digest HTML, not from destination URL).
 
 after_initialize do
   require_dependency "user_notifications"
@@ -32,6 +33,13 @@ after_initialize do
     ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS = true
     CONTENT_REDIRECTOR_PATH  = "/content"
     CONTENT_REDIRECTOR_PARAM = "u"
+
+    # Append tracking params to FINAL destination URL BEFORE encoding (post-body links only)
+    ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS = true
+
+    # These params will be appended to the FINAL destination URL (before base64url-encoding into /content?u=...)
+    # Value will be "#{user_id}-#{topic_id_context}" when topic_id_context is known, else "#{user_id}".
+    TRACKING_PARAMS_TO_APPEND = ["aff_sub2", "subid"]
 
     ENABLE_TRIM_HTML_PART = true
     HTML_MAX_CHARS        = 300
@@ -166,6 +174,107 @@ after_initialize do
     end
 
     # ============================================================
+    # Topic ID extraction
+    # ============================================================
+
+    def self.extract_topic_id_from_href(href, base)
+      h = href.to_s
+      return nil if h.empty?
+      return nil unless h.include?("/t/")
+
+      path =
+        if h.start_with?("/")
+          h
+        elsif h.start_with?(base)
+          h.sub(base, "")
+        else
+          h
+        end
+
+      m = path.match(%r{/t/(?:[^/]+/)?(\d+)}i)
+      m ? m[1] : nil
+    rescue
+      nil
+    end
+
+    # Try to infer "current digest topic id" for a given excerpt node.
+    #
+    # Strategy (cheap, robust):
+    # 1) If any ancestor has data-topic-id / data-topicid / topic-id, use it.
+    # 2) Look for the closest preceding p.digest-topic-name that has a /t/... link.
+    # 3) As fallback, look for a preceding /t/... link anywhere (closest) and use that id.
+    def self.topic_id_context_for_excerpt(node, base)
+      return nil unless node
+
+      # 1) ancestor attributes
+      begin
+        anc = node.at_xpath("ancestor-or-self::*[@data-topic-id or @data-topicid or @topic-id][1]")
+        if anc
+          v = anc["data-topic-id"] || anc["data-topicid"] || anc["topic-id"]
+          vv = v.to_s.strip
+          return vv if vv.match?(/^\d+$/)
+        end
+      rescue
+        # ignore
+      end
+
+      # 2) closest preceding digest-topic-name
+      begin
+        a = node.at_xpath("preceding::p[contains(concat(' ', normalize-space(@class), ' '), ' digest-topic-name ')][1]//a[@href][1]")
+        if a && a["href"]
+          id = extract_topic_id_from_href(a["href"], base)
+          return id if id
+        end
+      rescue
+        # ignore
+      end
+
+      # 3) closest preceding /t/ anchor
+      begin
+        a2 = node.at_xpath("preceding::a[contains(@href, '/t/')][1]")
+        if a2 && a2["href"]
+          id2 = extract_topic_id_from_href(a2["href"], base)
+          return id2 if id2
+        end
+      rescue
+        # ignore
+      end
+
+      nil
+    end
+
+    def self.user_topic_value(user_id, topic_id_context)
+      uid = user_id.to_s
+      return "" if uid.empty?
+      tid = topic_id_context.to_s
+      return uid if tid.empty?
+      "#{uid}-#{tid}"
+    end
+
+    # Append aff_sub2/subid to destination URL BEFORE encoding into /content
+    def self.append_tracking_params(url, user_id, topic_id_context)
+      return url if url.to_s.empty?
+      val = user_topic_value(user_id, topic_id_context)
+      return url if val.empty?
+
+      uri = URI.parse(url)
+      return url unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
+
+      params = URI.decode_www_form(uri.query || "")
+
+      TRACKING_PARAMS_TO_APPEND.each do |k|
+        next if k.to_s.empty?
+        next if params.any? { |kk, _| kk == k }
+        params << [k, val]
+      end
+
+      uri.query = URI.encode_www_form(params)
+      uri.to_s
+    rescue
+      url
+    end
+
+    # ============================================================
     # "Popular Posts" boundary helpers (robust)
     # ============================================================
 
@@ -188,34 +297,9 @@ after_initialize do
 
     def self.before_marker?(node, marker)
       return true unless marker
-      # Nokogiri nodes are Comparable by document order
       node < marker
     rescue
       true
-    end
-
-    # ============================================================
-    # Topic ID extraction
-    # ============================================================
-
-    def self.extract_topic_id_from_href(href, base)
-      h = href.to_s
-      return nil if h.empty?
-      return nil unless h.include?("/t/")
-
-      path =
-        if h.start_with?("/")
-          h
-        elsif h.start_with?(base)
-          h.sub(base, "")
-        else
-          h
-        end
-
-      m = path.match(%r{/t/(?:[^/]+/)?(\d+)}i)
-      m ? m[1] : nil
-    rescue
-      nil
     end
 
     # ============================================================
@@ -349,9 +433,6 @@ after_initialize do
 
     # ============================================================
     # Line-break trimming (respects ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES)
-    # - If break occurs before max_chars: trim to that break
-    #   * switch true  => remove trailing nodes (images/objects too)
-    #   * switch false => remove trailing TEXT only (keep images/objects)
     # ============================================================
 
     def self.trim_html_at_first_line_break!(node, max_chars)
@@ -393,17 +474,12 @@ after_initialize do
     end
 
     # ============================================================
-    # HTML: trim in-place:
-    # - First trim to first visual line break if it occurs before max_chars
-    # - Then enforce max_chars by trimming text nodes forward
-    # - Switch controls whether trailing NON-TEXT nodes are removed too
+    # HTML: trim in-place
     # ============================================================
 
     def self.trim_html_node_in_place!(node, max_chars)
-      # A) First enforce "first line break (if before max_chars)"
       break_trimmed = trim_html_at_first_line_break!(node, max_chars)
 
-      # B) Then enforce "max chars" on what remains
       full_norm = normalize_spaces(node.text.to_s)
       return break_trimmed if full_norm.length <= max_chars
 
@@ -430,7 +506,6 @@ after_initialize do
           if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
             remove_following_siblings_up_to_root!(tn, node)
           else
-            # Remove all remaining text nodes AFTER this one (keeps images/objects)
             text_nodes[(idx + 1)..-1].to_a.each(&:remove)
           end
 
@@ -440,7 +515,6 @@ after_initialize do
         end
       end
 
-      # If we trimmed at a line break (but not by chars), add ellipsis to show there was more.
       if break_trimmed && !trimming_started
         append_ellipsis_to_last_text!(node)
       end
@@ -489,7 +563,6 @@ after_initialize do
       end
 
       if !Nokogiri
-        # keep old fallback (no /content rewrite here)
         if ENABLE_LINK_REWRITE
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
@@ -568,60 +641,64 @@ after_initialize do
             .flat_map { |sel| doc.css(sel).to_a }
             .uniq
 
-        if excerpt_nodes.any?
-          excerpt_nodes.each do |node|
-            node.css("a[href]").each do |a|
-              href = a["href"].to_s.strip
-              next if href.empty?
-              next if href.start_with?("mailto:", "tel:", "sms:", "#")
-              next if contains_any?(href, NEVER_TOUCH_HREF_SUBSTRINGS)
+        excerpt_nodes.each do |node|
+          # derive topic-id context ONCE per excerpt node
+          topic_ctx = topic_id_context_for_excerpt(node, base)
 
-              abs0 = absolute_url_from_href(href, base)
-              next if abs0.nil?
-              next unless http_url?(abs0)
+          node.css("a[href]").each do |a|
+            href = a["href"].to_s.strip
+            next if href.empty?
+            next if href.start_with?("mailto:", "tel:", "sms:", "#")
+            next if contains_any?(href, NEVER_TOUCH_HREF_SUBSTRINGS)
 
-              # skip if it's already /content
-              begin
-                u0 = URI.parse(abs0)
-                b0 = URI.parse(base)
-                if u0.host == b0.host && u0.path == CONTENT_REDIRECTOR_PATH
-                  next
-                end
-              rescue
-                # ignore
+            abs0 = absolute_url_from_href(href, base)
+            next if abs0.nil?
+            next unless http_url?(abs0)
+
+            # skip if it's already /content
+            begin
+              u0 = URI.parse(abs0)
+              b0 = URI.parse(base)
+              if u0.host == b0.host && u0.path == CONTENT_REDIRECTOR_PATH
+                next
+              end
+            rescue
+              # ignore
+            end
+
+            final_dest =
+              if ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS
+                append_tracking_params(abs0, user.id, topic_ctx)
+              else
+                abs0
               end
 
-              redirect_abs = make_content_redirector_url(abs0, base)
-              next if redirect_abs.nil?
+            redirect_abs = make_content_redirector_url(final_dest, base)
+            next if redirect_abs.nil?
 
-              a["href"] = redirect_abs
-              changed = true
-            end
+            a["href"] = redirect_abs
+            changed = true
           end
         end
       end
 
       # 3) HTML excerpt trimming
-      if ENABLE_TRIM_HTML_PART
-        unless skip_trim
-          if do_trim
-            nodes =
-              HTML_EXCERPT_SELECTORS
-                .flat_map { |sel| doc.css(sel).to_a }
-                .uniq
+      if ENABLE_TRIM_HTML_PART && !skip_trim && do_trim
+        nodes =
+          HTML_EXCERPT_SELECTORS
+            .flat_map { |sel| doc.css(sel).to_a }
+            .uniq
 
-            nodes.each do |node|
-              begin
-                hrefs = node.css("a[href]").map { |x| x["href"].to_s }
-                next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
-              rescue
-                next
-              end
+        nodes.each do |node|
+          begin
+            hrefs = node.css("a[href]").map { |x| x["href"].to_s }
+            next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
+          rescue
+            next
+          end
 
-              if trim_html_node_in_place!(node, HTML_MAX_CHARS)
-                changed = true
-              end
-            end
+          if trim_html_node_in_place!(node, HTML_MAX_CHARS)
+            changed = true
           end
         end
       end
@@ -653,7 +730,6 @@ after_initialize do
 
     # ============================================================
     # TEXT trimming (topic-body-only)
-    # - trim to MIN(TEXT_MAX_CHARS, first newline if it occurs before max)
     # ============================================================
 
     def self.count_topics_in_text_blocks(blocks)
