@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.5
+# version: 1.8
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL EXTERNAL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
@@ -12,10 +12,12 @@
 #        NEW (v1.3): normalize_spaces collapses ALL whitespace so we don't cut early at line breaks.
 #        NEW (v1.5): FIX topic counting: no longer relies solely on /t/... links (tracked links break it).
 #                  - "Popular Posts" boundary detection tightened (headings/strong only; must be a likely header)
-#                  - Topic counting now:
-#                      1) tries data-topic-id in scoped doc
-#                      2) tries /t/.../<id> in hrefs
-#                      3) FALLBACK: counts excerpt nodes (what you actually trim) in scoped doc
+#        NEW (v1.6): FIX trimming when only ONE topic exists:
+#                  - If topic ids are observed (data-topic-id OR /t/.../<id>), treat count>=1 as definitive.
+#                  - Fallback excerpt-node counting only used when NO topic ids are found.
+#                  - If excerpt nodes exist but no ids, assume 1 topic.
+#        NEW (v1.7): Added option to remove ALL DOM after cut point (removes trailing images/elements).
+#        NEW (v1.8): Make trailing-image removal optional via switch.
 
 after_initialize do
   require_dependency "user_notifications"
@@ -46,6 +48,12 @@ after_initialize do
 
     ENABLE_TRIM_TEXT_PART = true
     TEXT_MAX_CHARS        = 300
+
+    # NEW (v1.8):
+    # If true: when we cut inside an excerpt, delete ALL nodes that come after the cut point
+    #          (this removes trailing <img>/<figure>/<picture>/etc).
+    # If false: only text nodes are removed (images/elements after the cut may remain).
+    ENABLE_REMOVE_TRAILING_ELEMENTS_AFTER_CUT = true
 
     HTML_EXCERPT_SELECTORS = [
       ".digest-post-excerpt",
@@ -201,7 +209,7 @@ after_initialize do
     end
 
     # ============================================================
-    # Topic counting (BEFORE "Popular Posts") - v1.5 robust
+    # Topic counting (BEFORE "Popular Posts") - robust (v1.6+)
     # ============================================================
 
     def self.extract_topic_id_from_href(href, base)
@@ -226,7 +234,6 @@ after_initialize do
 
     def self.count_topics_in_html_doc(doc)
       scope = scoped_doc_before_popular(doc)
-
       base = Discourse.base_url
 
       # (1) Best: data-topic-id exists in many digest templates
@@ -237,7 +244,7 @@ after_initialize do
           .reject(&:empty?)
           .uniq
 
-      return ids1.size if ids1.size > 1
+      return ids1.size if ids1.size >= 1
 
       # (2) Next: /t/.../<id> links (works when not tracked/redirected)
       ids2 =
@@ -247,18 +254,18 @@ after_initialize do
           .compact
           .uniq
 
-      return ids2.size if ids2.size > 1
+      return ids2.size if ids2.size >= 1
 
-      # (3) Fallback: count excerpt nodes (this matches what you *actually* trim)
+      # (3) Fallback ONLY when no ids found:
       excerpt_nodes =
         HTML_EXCERPT_SELECTORS
           .flat_map { |sel| scope.css(sel).to_a }
           .uniq
 
-      return excerpt_nodes.size if excerpt_nodes.size > 1
+      # Multiple excerpt blocks can still be ONE topic -> assume 1 if any exist
+      return 1 if excerpt_nodes.size >= 1
 
-      # If we got here, we truly couldn't observe multiple topics
-      [ids1.size, ids2.size, excerpt_nodes.size].max
+      0
     rescue
       999 # fail-open: do NOT accidentally skip trimming
     end
@@ -272,15 +279,44 @@ after_initialize do
       scoped_text = cutoff ? blocks[0...cutoff].join("\n\n") : blocks.join("\n\n")
       ids = scoped_text.scan(%r{/t/(?:[^/\s]+/)?(\d+)}i).flatten.uniq
 
-      # fallback: if we can’t find ids but there are multiple “topic URL” blocks, treat as multiple
-      return ids.size if ids.size > 1
+      # if we observe ANY topic ids, that is definitive (1 => 1)
+      return ids.size if ids.size >= 1
 
+      # fallback: if we can’t find ids but there are multiple “topic URL” blocks, treat as multiple
       topic_url_blocks = (cutoff ? blocks[0...cutoff] : blocks).count { |b| b.to_s =~ TEXT_TOPIC_URL_REGEX }
       return topic_url_blocks if topic_url_blocks > 1
 
-      ids.size
+      0
     rescue
       999 # fail-open
+    end
+
+    # ============================================================
+    # Optional: remove EVERYTHING after cut point (elements too)
+    # ============================================================
+
+    def self.remove_everything_after_point!(container_node, point_node)
+      return if container_node.nil? || point_node.nil?
+
+      cur = point_node
+
+      # Walk upward toward container_node.
+      # At each level, remove all siblings AFTER the current node.
+      while cur && cur != container_node
+        parent = cur.parent
+        break if parent.nil?
+
+        sib = cur.next_sibling
+        while sib
+          nxt = sib.next_sibling
+          sib.remove
+          sib = nxt
+        end
+
+        cur = parent
+      end
+    rescue
+      nil
     end
 
     # ============================================================
@@ -312,8 +348,14 @@ after_initialize do
           tn.content = smart_trim_plain(raw, budget)
           trimming_started = true
 
-          # Remove all remaining text nodes AFTER this one
-          text_nodes[(idx + 1)..-1].to_a.each(&:remove)
+          if ENABLE_REMOVE_TRAILING_ELEMENTS_AFTER_CUT
+            # Remove ALL DOM after cut point (images/elements too)
+            remove_everything_after_point!(node, tn)
+          else
+            # Legacy behavior: only remove remaining TEXT nodes (images/elements may remain)
+            text_nodes[(idx + 1)..-1].to_a.each(&:remove)
+          end
+
           break
         else
           tn.remove
