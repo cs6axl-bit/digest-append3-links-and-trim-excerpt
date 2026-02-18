@@ -1,12 +1,13 @@
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.5
+# version: 1.6
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
+#        FIX (v1.6): Topic counting is computed BEFORE /content rewrites (so /t/... ids aren't lost), and "Popular Posts" boundary uses document order (robust even if the whole email is one big table).
 #        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
 #        HTML trim preserves markup by trimming text nodes in-place.
 #        Count topics ONLY before "Popular Posts" section.
-#        Count topics by UNIQUE topic_id (from /t/.../<id>) to avoid overcount when one topic renders multiple excerpt blocks.
+#        Count topics by UNIQUE topic_id (from /t/.../<id>) when available to avoid overcount.
 #        HTML trimming trims FORWARD (keeps early paragraphs), not reverse-deleting later nodes.
 #        normalize_spaces collapses ALL whitespace so we don't cut early at line breaks.
 
@@ -141,18 +142,8 @@ after_initialize do
       false
     end
 
-    # If only one topic header exists in the digest (p.digest-topic-name),
-    # skip excerpt trimming entirely.
-    def self.only_one_digest_topic_name?(doc)
-      return false unless doc
-      nodes = doc.css("p.digest-topic-name")
-      nodes && nodes.size == 1
-    rescue
-      false
-    end
-
     # ============================================================
-    # "Popular Posts" boundary helpers
+    # "Popular Posts" boundary helpers (robust)
     # ============================================================
 
     def self.node_text_matches_popular?(node)
@@ -163,38 +154,25 @@ after_initialize do
       false
     end
 
-    def self.scoped_doc_before_popular(doc)
-      return doc unless doc
-
-      marker =
-        doc.css("h1,h2,h3,h4,h5,h6,strong,b,td,th,p,div,span").find do |n|
-          node_text_matches_popular?(n)
-        end
-
-      return doc unless marker
-
-      body = doc.at("body")
-      return doc unless body
-
-      # Find the top-level body child that contains the marker (or is the marker)
-      top = marker
-      while top && top.parent && top.parent != body
-        top = top.parent
+    def self.find_popular_marker_node(doc)
+      return nil unless doc
+      doc.css("h1,h2,h3,h4,h5,h6,strong,b,td,th,p,div,span").find do |n|
+        node_text_matches_popular?(n)
       end
-
-      parts = []
-      body.children.each do |child|
-        break if child == top
-        parts << child.to_html
-      end
-
-      Nokogiri::HTML(parts.join("\n"))
     rescue
-      doc # fail-open: behave as before
+      nil
+    end
+
+    def self.before_marker?(node, marker)
+      return true unless marker
+      # Nokogiri nodes are Comparable by document order
+      node < marker
+    rescue
+      true
     end
 
     # ============================================================
-    # Topic counting (BEFORE "Popular Posts") by UNIQUE topic_id
+    # Topic ID extraction
     # ============================================================
 
     def self.extract_topic_id_from_href(href, base)
@@ -217,33 +195,53 @@ after_initialize do
       nil
     end
 
-    def self.count_topics_in_html_doc(doc)
-      scope = scoped_doc_before_popular(doc)
-      base = Discourse.base_url
+    # ============================================================
+    # Primary topic counting BEFORE Popular Posts (v1.6 fix)
+    # - Must be computed BEFORE we rewrite excerpt links to /content
+    # - Prefer p.digest-topic-name blocks, dedup by topic_id if possible
+    # - Fallback: scan all anchors for /t/.../<id> before marker
+    # - Unknown => nil (caller should fail-open to trimming)
+    # ============================================================
 
-      ids =
-        scope
-          .css("a[href]")
-          .map { |a| extract_topic_id_from_href(a["href"], base) }
-          .compact
-          .uniq
+    def self.primary_topic_count_before_popular(doc)
+      return nil unless doc
+      base   = Discourse.base_url
+      marker = find_popular_marker_node(doc)
 
-      ids.size
-    rescue
-      999 # fail-open: do NOT accidentally skip trimming
-    end
+      keys = []
 
-    def self.count_topics_in_text_blocks(blocks)
-      cutoff = blocks.find_index do |b|
-        t = normalize_spaces(b).downcase
-        POPULAR_POSTS_MARKERS.any? { |m| t.include?(m) }
+      # 1) Prefer digest topic-name blocks
+      doc.css("p.digest-topic-name").each do |p|
+        next unless before_marker?(p, marker)
+
+        a = p.at_css("a[href]")
+        id = a ? extract_topic_id_from_href(a["href"], base) : nil
+
+        title = normalize_spaces(p.text)
+        if id
+          keys << "id:#{id}"
+        elsif !title.empty?
+          keys << "t:#{title}"
+        end
       end
 
-      scoped_text = cutoff ? blocks[0...cutoff].join("\n\n") : blocks.join("\n\n")
-      ids = scoped_text.scan(%r{/t/(?:[^/\s]+/)?(\d+)}i).flatten.uniq
-      ids.size
+      keys = keys.compact.uniq
+      return keys.size if keys.any?
+
+      # 2) Fallback: scan anchors for /t/ ids (before marker)
+      ids = []
+      doc.css("a[href]").each do |a|
+        next unless before_marker?(a, marker)
+        id = extract_topic_id_from_href(a["href"], base)
+        ids << id if id
+      end
+
+      ids = ids.compact.uniq
+      return ids.size if ids.any?
+
+      nil
     rescue
-      999 # fail-open
+      nil
     end
 
     # ============================================================
@@ -294,7 +292,7 @@ after_initialize do
 
     def self.process_html_part!(message, user, email_id)
       return if message.nil?
-      return unless ENABLE_LINK_REWRITE || ENABLE_TRIM_HTML_PART
+      return unless ENABLE_LINK_REWRITE || ENABLE_TRIM_HTML_PART || ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
 
       html_part =
         if message.respond_to?(:html_part) && message.html_part
@@ -315,7 +313,7 @@ after_initialize do
       if ENABLE_TRIM_HTML_PART
         selector_hints = ["digest-post-excerpt", "post-excerpt", "topic-excerpt", "itemprop=\"articleBody\"", "itemprop='articleBody'", "excerpt", "digest-topic-name"]
         has_trim_hint = selector_hints.any? { |h| body.include?(h) }
-        return if !has_trim_hint && !ENABLE_LINK_REWRITE
+        return if !has_trim_hint && !ENABLE_LINK_REWRITE && !ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
       end
 
       if !Nokogiri
@@ -329,6 +327,13 @@ after_initialize do
       dayofweek_val = encoded_email(user)
       doc = Nokogiri::HTML(body)
       changed = false
+
+      # v1.6: compute primary topic count NOW (before any /content rewrites)
+      primary_topic_count = primary_topic_count_before_popular(doc)
+      # Skip trim ONLY when we are confident it's exactly 1.
+      skip_trim = (primary_topic_count == 1)
+      # If unknown (nil), fail-open to trimming when enabled.
+      do_trim = primary_topic_count.nil? ? true : (primary_topic_count > 1)
 
       # 1) rewrite INTERNAL links (as before): add isdigest/u/dayofweek/email_id
       if ENABLE_LINK_REWRITE
@@ -421,14 +426,7 @@ after_initialize do
 
       # 3) HTML excerpt trimming
       if ENABLE_TRIM_HTML_PART
-        # NEW: If only one digest topic name exists, skip trimming entirely.
-        skip_trim = only_one_digest_topic_name?(doc)
-
         unless skip_trim
-          # Keep prior logic too: if only one UNIQUE topic_id exists BEFORE "Popular Posts", skip trimming
-          topic_count = count_topics_in_html_doc(doc)
-          do_trim = topic_count > 1
-
           if do_trim
             nodes =
               HTML_EXCERPT_SELECTORS
@@ -479,6 +477,19 @@ after_initialize do
     # ============================================================
     # TEXT trimming (topic-body-only)
     # ============================================================
+
+    def self.count_topics_in_text_blocks(blocks)
+      cutoff = blocks.find_index do |b|
+        t = normalize_spaces(b).downcase
+        POPULAR_POSTS_MARKERS.any? { |m| t.include?(m) }
+      end
+
+      scoped_text = cutoff ? blocks[0...cutoff].join("\n\n") : blocks.join("\n\n")
+      ids = scoped_text.scan(%r{/t/(?:[^/\s]+/)?(\d+)}i).flatten.uniq
+      ids.size
+    rescue
+      999 # fail-open: do NOT accidentally skip trimming
+    end
 
     def self.trim_digest_text_part!(message)
       return if message.nil?
