@@ -1,15 +1,13 @@
+# frozen_string_literal: true
+
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.6
+# version: 1.7.1
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
-#        FIX (v1.6): Topic counting is computed BEFORE /content rewrites (so /t/... ids aren't lost), and "Popular Posts" boundary uses document order (robust even if the whole email is one big table).
-#        Optimized for high volume: single Nokogiri parse, cheap pre-checks, and separate switches for HTML/TEXT trimming.
-#        HTML trim preserves markup by trimming text nodes in-place.
-#        Count topics ONLY before "Popular Posts" section.
-#        Count topics by UNIQUE topic_id (from /t/.../<id>) when available to avoid overcount.
-#        HTML trimming trims FORWARD (keeps early paragraphs), not reverse-deleting later nodes.
-#        normalize_spaces collapses ALL whitespace so we don't cut early at line breaks.
+#        FIX  (v1.6): Topic counting computed BEFORE /content rewrites; Popular Posts boundary uses document order (robust even if whole email is one big table).
+#        PLUS (v1.7): Trim to MIN(max_chars, first visual line break).
+#        FIX  (v1.7.1): Line-break trimming now RESPECTS ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES (keep images/objects when false).
 
 after_initialize do
   require_dependency "user_notifications"
@@ -32,7 +30,7 @@ after_initialize do
 
     # Rewrite links inside post bodies (excerpts) to /content?u=<base64url(url)>
     ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS = true
-    CONTENT_REDIRECTOR_PATH = "/content"
+    CONTENT_REDIRECTOR_PATH  = "/content"
     CONTENT_REDIRECTOR_PARAM = "u"
 
     ENABLE_TRIM_HTML_PART = true
@@ -40,6 +38,11 @@ after_initialize do
 
     ENABLE_TRIM_TEXT_PART = true
     TEXT_MAX_CHARS        = 300
+
+    # If true, when we trim an excerpt we ALSO remove any trailing HTML nodes
+    # (images, tables, oneboxes, etc.) after the cut point.
+    # If false, we remove ONLY trailing text nodes (images/objects may remain).
+    ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES = true
 
     HTML_EXCERPT_SELECTORS = [
       ".digest-post-excerpt",
@@ -55,6 +58,7 @@ after_initialize do
     ]
 
     TEXT_TOPIC_URL_REGEX = %r{(^|\s)(https?://\S+)?/t/[^ \n]+}i
+
     TEXT_NEVER_TRIM_KEYWORDS = [
       "unsubscribe",
       "/email/unsubscribe",
@@ -104,16 +108,35 @@ after_initialize do
       needles.any? { |n| h.include?(n) }
     end
 
+    # Trim to min(max_chars, first newline if it occurs before max_chars).
     def self.smart_trim_plain(text, max_chars)
-      t = normalize_spaces(text)
-      return t if t.length <= max_chars
+      raw = text.to_s.gsub(/\r\n?/, "\n")
+
+      nl = raw.index("\n")
+      linebreak_forced = nl && nl > 0 && nl < max_chars
+
+      if linebreak_forced
+        kept = raw[0, nl]
+        kept_norm = normalize_spaces(kept)
+        return kept_norm if kept_norm.empty?
+        return kept_norm.end_with?("…") ? kept_norm : (kept_norm + "…")
+      end
+
+      full_norm = normalize_spaces(raw)
+      return full_norm if full_norm.length <= max_chars
 
       limit = [max_chars - 1, 0].max
-      cut = t[0, limit]
+      cut = full_norm[0, limit]
+
       if (idx = cut.rindex(/\s/))
         cut = cut[0, idx]
       end
-      cut.rstrip + "…"
+
+      cut = cut.rstrip
+      return cut if cut.empty?
+      cut.end_with?("…") ? cut : (cut + "…")
+    rescue
+      normalize_spaces(text)
     end
 
     def self.base64url_encode(s)
@@ -197,10 +220,6 @@ after_initialize do
 
     # ============================================================
     # Primary topic counting BEFORE Popular Posts (v1.6 fix)
-    # - Must be computed BEFORE we rewrite excerpt links to /content
-    # - Prefer p.digest-topic-name blocks, dedup by topic_id if possible
-    # - Fallback: scan all anchors for /t/.../<id> before marker
-    # - Unknown => nil (caller should fail-open to trimming)
     # ============================================================
 
     def self.primary_topic_count_before_popular(doc)
@@ -245,21 +264,157 @@ after_initialize do
     end
 
     # ============================================================
-    # HTML: trim in-place FORWARD (keeps early paragraphs), then cuts once
+    # HTML trimming helpers
+    # ============================================================
+
+    def self.append_ellipsis_to_last_text!(node)
+      tn = node.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]")
+               .to_a
+               .reverse
+               .find { |t| !normalize_spaces(t.text).empty? }
+      return false unless tn
+
+      s = tn.text.to_s.rstrip
+      return false if s.end_with?("…")
+
+      tn.content = s + "…"
+      true
+    rescue
+      false
+    end
+
+    def self.text_before_node(root, stop_node)
+      out = +""
+      root.traverse do |n|
+        break if n == stop_node
+        if n.text?
+          out << n.text
+          out << " "
+        end
+      end
+      out
+    rescue
+      ""
+    end
+
+    def self.has_content_after_boundary?(boundary, root)
+      cur = boundary
+      while cur && cur != root
+        sib = cur.next_sibling
+        while sib
+          if sib.element?
+            return true
+          elsif sib.text?
+            return true unless normalize_spaces(sib.text).empty?
+          end
+          sib = sib.next_sibling
+        end
+        cur = cur.parent
+      end
+      false
+    rescue
+      true
+    end
+
+    def self.remove_following_siblings_up_to_root!(boundary, root)
+      cur = boundary
+      while cur && cur != root
+        cur.xpath("following-sibling::node()").each(&:remove)
+        cur = cur.parent
+      end
+      true
+    rescue
+      false
+    end
+
+    def self.end_node_for_kept_region(boundary)
+      return boundary unless boundary
+      last_desc = boundary.xpath(".//node()").to_a.last
+      last_desc || boundary
+    rescue
+      boundary
+    end
+
+    # Remove ONLY text nodes after a given end node (keeps images/objects).
+    def self.remove_text_nodes_after_end!(root, end_node)
+      return false unless root && end_node
+      root.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]").each do |tn|
+        next unless tn > end_node
+        tn.remove
+      end
+      true
+    rescue
+      false
+    end
+
+    # ============================================================
+    # Line-break trimming (respects ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES)
+    # - If break occurs before max_chars: trim to that break
+    #   * switch true  => remove trailing nodes (images/objects too)
+    #   * switch false => remove trailing TEXT only (keep images/objects)
+    # ============================================================
+
+    def self.trim_html_at_first_line_break!(node, max_chars)
+      return false unless node
+
+      # 1) <br> is the strongest "line break" signal
+      br = node.at_css("br")
+      if br
+        before_len = normalize_spaces(text_before_node(node, br)).length
+        if before_len > 0 && before_len < max_chars && has_content_after_boundary?(br, node)
+          if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
+            remove_following_siblings_up_to_root!(br, node)
+          else
+            remove_text_nodes_after_end!(node, br) # keep images/objects
+          end
+          br.remove
+          return true
+        end
+      end
+
+      # 2) End of first paragraph/list item boundary
+      boundary = node.at_css("p,li")
+      if boundary
+        kept_len = normalize_spaces(boundary.text).length
+        if kept_len > 0 && kept_len < max_chars && has_content_after_boundary?(boundary, node)
+          if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
+            remove_following_siblings_up_to_root!(boundary, node)
+          else
+            end_node = end_node_for_kept_region(boundary)
+            remove_text_nodes_after_end!(node, end_node) # keep images/objects
+          end
+          return true
+        end
+      end
+
+      false
+    rescue
+      false
+    end
+
+    # ============================================================
+    # HTML: trim in-place:
+    # - First trim to first visual line break if it occurs before max_chars
+    # - Then enforce max_chars by trimming text nodes forward
+    # - Switch controls whether trailing NON-TEXT nodes are removed too
     # ============================================================
 
     def self.trim_html_node_in_place!(node, max_chars)
+      # A) First enforce "first line break (if before max_chars)"
+      break_trimmed = trim_html_at_first_line_break!(node, max_chars)
+
+      # B) Then enforce "max chars" on what remains
       full_norm = normalize_spaces(node.text.to_s)
-      return false if full_norm.length <= max_chars
+      return break_trimmed if full_norm.length <= max_chars
 
       text_nodes = node.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]").to_a
-      return false if text_nodes.empty?
+      return break_trimmed if text_nodes.empty?
 
       budget = max_chars
       trimming_started = false
 
       text_nodes.each_with_index do |tn, idx|
-        raw = tn.text.to_s
+        raw  = tn.text.to_s
         norm = normalize_spaces(raw)
         next if norm.empty?
 
@@ -269,19 +424,28 @@ after_initialize do
             next
           end
 
-          # Cut inside THIS node (keeps earlier content + adds ellipsis)
           tn.content = smart_trim_plain(raw, budget)
           trimming_started = true
 
-          # Remove all remaining text nodes AFTER this one
-          text_nodes[(idx + 1)..-1].to_a.each(&:remove)
+          if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
+            remove_following_siblings_up_to_root!(tn, node)
+          else
+            # Remove all remaining text nodes AFTER this one (keeps images/objects)
+            text_nodes[(idx + 1)..-1].to_a.each(&:remove)
+          end
+
           break
         else
           tn.remove
         end
       end
 
-      true
+      # If we trimmed at a line break (but not by chars), add ellipsis to show there was more.
+      if break_trimmed && !trimming_started
+        append_ellipsis_to_last_text!(node)
+      end
+
+      trimming_started || break_trimmed
     rescue
       false
     end
@@ -311,13 +475,21 @@ after_initialize do
       end
 
       if ENABLE_TRIM_HTML_PART
-        selector_hints = ["digest-post-excerpt", "post-excerpt", "topic-excerpt", "itemprop=\"articleBody\"", "itemprop='articleBody'", "excerpt", "digest-topic-name"]
+        selector_hints = [
+          "digest-post-excerpt",
+          "post-excerpt",
+          "topic-excerpt",
+          "itemprop=\"articleBody\"",
+          "itemprop='articleBody'",
+          "excerpt",
+          "digest-topic-name"
+        ]
         has_trim_hint = selector_hints.any? { |h| body.include?(h) }
         return if !has_trim_hint && !ENABLE_LINK_REWRITE && !ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
       end
 
       if !Nokogiri
-        # keep your old fallback (no /content rewrite here)
+        # keep old fallback (no /content rewrite here)
         if ENABLE_LINK_REWRITE
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
@@ -330,12 +502,14 @@ after_initialize do
 
       # v1.6: compute primary topic count NOW (before any /content rewrites)
       primary_topic_count = primary_topic_count_before_popular(doc)
+
       # Skip trim ONLY when we are confident it's exactly 1.
       skip_trim = (primary_topic_count == 1)
+
       # If unknown (nil), fail-open to trimming when enabled.
       do_trim = primary_topic_count.nil? ? true : (primary_topic_count > 1)
 
-      # 1) rewrite INTERNAL links (as before): add isdigest/u/dayofweek/email_id
+      # 1) rewrite INTERNAL links: add isdigest/u/dayofweek/email_id
       if ENABLE_LINK_REWRITE
         doc.css("a[href]").each do |a|
           href = a["href"].to_s.strip
@@ -357,20 +531,23 @@ after_initialize do
           next unless uri.scheme.nil? || uri.scheme == "http" || uri.scheme == "https"
 
           params = URI.decode_www_form(uri.query || "")
-
           added = false
+
           unless params.any? { |k, _| k == "isdigest" }
             params << ["isdigest", "1"]
             added = true
           end
+
           unless params.any? { |k, _| k == "u" }
             params << ["u", user.id.to_s]
             added = true
           end
+
           if !dayofweek_val.empty? && !params.any? { |k, _| k == "dayofweek" }
             params << ["dayofweek", dayofweek_val]
             added = true
           end
+
           if email_id && !email_id.empty? && !params.any? { |k, _| k == "email_id" }
             params << ["email_id", email_id]
             added = true
@@ -462,8 +639,8 @@ after_initialize do
         url = Regexp.last_match(1)
 
         next %{href="#{url}"} if url.include?("isdigest=") ||
-                                url.include?("email_id=") ||
-                                contains_any?(url, NEVER_TOUCH_HREF_SUBSTRINGS)
+                                 url.include?("email_id=") ||
+                                 contains_any?(url, NEVER_TOUCH_HREF_SUBSTRINGS)
 
         joiner = url.include?("?") ? "&" : "?"
         extra  = "isdigest=1&u=#{user.id}"
@@ -476,6 +653,7 @@ after_initialize do
 
     # ============================================================
     # TEXT trimming (topic-body-only)
+    # - trim to MIN(TEXT_MAX_CHARS, first newline if it occurs before max)
     # ============================================================
 
     def self.count_topics_in_text_blocks(blocks)
@@ -520,10 +698,15 @@ after_initialize do
         prev_has_topic_url = !!(prev =~ TEXT_TOPIC_URL_REGEX)
         next unless prev_has_topic_url
 
-        norm_len = normalize_spaces(b).length
-        next if norm_len <= TEXT_MAX_CHARS
+        b2 = b.to_s.gsub(/\r\n?/, "\n")
+        nl = b2.index("\n")
+        linebreak_forced = nl && nl > 0 && nl < TEXT_MAX_CHARS
 
-        blocks[i] = smart_trim_plain(b, TEXT_MAX_CHARS)
+        norm_len = normalize_spaces(b2).length
+        need_trim = linebreak_forced || (norm_len > TEXT_MAX_CHARS)
+        next unless need_trim
+
+        blocks[i] = smart_trim_plain(b2, TEXT_MAX_CHARS)
         changed = true
       end
 
