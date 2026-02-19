@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.7.6
+# version: 1.7.7
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
@@ -9,6 +9,7 @@
 #        PLUS (v1.7): Trim to MIN(max_chars, first visual line break).
 #        FIX  (v1.7.1): Line-break trimming now RESPECTS ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES (keep images/objects when false).
 #        PLUS (v1.7.6): For /content rewrite (post-body links), append aff_sub2 and subid2 where value is "#{user_id}-#{topic_id_of_current_digest_topic}" (topic id derived from surrounding digest HTML, not from destination URL).
+#        PLUS (v1.7.7): Tracking value becomes "#{user_id},#{topic_id_context},#{email_id}" and ALSO appends email_id as a separate param on the FINAL destination URL before encoding.
 
 after_initialize do
   require_dependency "user_notifications"
@@ -38,8 +39,12 @@ after_initialize do
     ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS = true
 
     # These params will be appended to the FINAL destination URL (before base64url-encoding into /content?u=...)
-    # Value will be "#{user_id}-#{topic_id_context}" when topic_id_context is known, else "#{user_id}".
+    # Value will be "#{user_id},#{topic_id_context},#{email_id}" when email_id present.
     TRACKING_PARAMS_TO_APPEND = ["aff_sub2", "subid2"]
+
+    # Also append email_id as a separate param on the FINAL destination URL (pre-encoding)
+    ENABLE_APPEND_EMAIL_ID_TO_POST_BODY_LINKS = true
+    POST_BODY_EMAIL_ID_PARAM = "email_id"
 
     ENABLE_TRIM_HTML_PART = true
     HTML_MAX_CHARS        = 300
@@ -243,35 +248,56 @@ after_initialize do
       nil
     end
 
-    def self.user_topic_value(user_id, topic_id_context)
+    # Build "userid,topicid,emailid" (topicid can be blank if unknown, but commas remain stable)
+    def self.user_topic_email_value(user_id, topic_id_context, email_id)
       uid = user_id.to_s
       return "" if uid.empty?
-      tid = topic_id_context.to_s
-      return uid if tid.empty?
-      "#{uid}-#{tid}"
+
+      tid = topic_id_context.to_s # may be blank
+      eid = email_id.to_s
+      return "" if eid.empty?
+
+      "#{uid},#{tid},#{eid}"
     end
 
-    # Append aff_sub2/subid to destination URL BEFORE encoding into /content
-    def self.append_tracking_params(url, user_id, topic_id_context)
+    # Append aff_sub2/subid2 (value "userid,topicid,emailid") AND append email_id as separate param
+    # BEFORE encoding into /content
+    def self.append_tracking_params(url, user_id, topic_id_context, email_id)
       return url if url.to_s.empty?
-      val = user_topic_value(user_id, topic_id_context)
-      return url if val.empty?
 
       uri = URI.parse(url)
       return url unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
 
       params = URI.decode_www_form(uri.query || "")
 
-      TRACKING_PARAMS_TO_APPEND.each do |k|
-        next if k.to_s.empty?
-        next if params.any? { |kk, _| kk == k }
-        params << [k, val]
+      # email_id as separate param
+      if ENABLE_APPEND_EMAIL_ID_TO_POST_BODY_LINKS
+        k = POST_BODY_EMAIL_ID_PARAM.to_s
+        if !k.empty? && email_id.to_s != "" && !params.any? { |kk, _| kk == k }
+          params << [k, email_id.to_s]
+        end
       end
 
+      val = user_topic_email_value(user_id, topic_id_context, email_id)
+      return (tap_set_query(uri, params) || uri.to_s) if val.empty?
+
+      TRACKING_PARAMS_TO_APPEND.each do |k|
+        kk = k.to_s
+        next if kk.empty?
+        next if params.any? { |k2, _| k2 == kk }
+        params << [kk, val]
+      end
+
+      tap_set_query(uri, params) || uri.to_s
+    rescue
+      url
+    end
+
+    def self.tap_set_query(uri, params)
       uri.query = URI.encode_www_form(params)
       uri.to_s
     rescue
-      url
+      nil
     end
 
     # ============================================================
@@ -668,7 +694,7 @@ after_initialize do
 
             final_dest =
               if ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS
-                append_tracking_params(abs0, user.id, topic_ctx)
+                append_tracking_params(abs0, user.id, topic_ctx, email_id)
               else
                 abs0
               end
