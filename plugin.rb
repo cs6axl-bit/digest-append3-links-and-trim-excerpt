@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.7.8
+# version: 1.7.9
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
@@ -9,8 +9,9 @@
 #        PLUS (v1.7): Trim to MIN(max_chars, first visual line break).
 #        FIX  (v1.7.1): Line-break trimming now RESPECTS ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES (keep images/objects when false).
 #        PLUS (v1.7.6): For /content rewrite (post-body links), append aff_sub2 and subid2 where value is "#{user_id}-#{topic_id_of_current_digest_topic}" (topic id derived from surrounding digest HTML, not from destination URL).
-#        PLUS (v1.7.7): Tracking value becomes "#{user_id},#{topic_id_context},#{email_id}" and ALSO appends email_id as a separate param on the FINAL destination URL before encoding.
+#        PLUS (v1.7.7): Tracking value becomes "#{user_id}-#{topic_id_context}-#{email_id}" and ALSO appends email_id as a separate param on the FINAL destination URL before encoding.
 #        FIX  (v1.7.8): Normalizes bad affiliate URLs where query params are mistakenly placed in the PATH like "/&subid=..." before appending our tracking params.
+#        CHANGE (v1.7.9): For post-body link tracking params (aff_sub2/subid2), use "-" separators instead of "," (userid-topicid-emailid).
 
 after_initialize do
   require_dependency "user_notifications"
@@ -40,7 +41,7 @@ after_initialize do
     ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS = true
 
     # These params will be appended to the FINAL destination URL (before base64url-encoding into /content?u=...)
-    # Value will be "#{user_id},#{topic_id_context},#{email_id}" when email_id present.
+    # Value will be "#{user_id}-#{topic_id_context}-#{email_id}" when email_id present.
     TRACKING_PARAMS_TO_APPEND = ["aff_sub2", "subid2"]
 
     # Also append email_id as a separate param on the FINAL destination URL (pre-encoding)
@@ -249,7 +250,7 @@ after_initialize do
       nil
     end
 
-    # Build "userid,topicid,emailid" (topicid can be blank if unknown, but commas remain stable)
+    # Build "userid-topicid-emailid" (topicid can be blank; keep the middle dash stable)
     def self.user_topic_email_value(user_id, topic_id_context, email_id)
       uid = user_id.to_s
       return "" if uid.empty?
@@ -258,7 +259,7 @@ after_initialize do
       eid = email_id.to_s
       return "" if eid.empty?
 
-      "#{uid},#{tid},#{eid}"
+      "#{uid}-#{tid}-#{eid}"
     end
 
     # ============================================================
