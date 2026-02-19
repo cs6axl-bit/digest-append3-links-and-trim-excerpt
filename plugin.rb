@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.7.7
+# version: 1.7.8
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
@@ -10,6 +10,7 @@
 #        FIX  (v1.7.1): Line-break trimming now RESPECTS ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES (keep images/objects when false).
 #        PLUS (v1.7.6): For /content rewrite (post-body links), append aff_sub2 and subid2 where value is "#{user_id}-#{topic_id_of_current_digest_topic}" (topic id derived from surrounding digest HTML, not from destination URL).
 #        PLUS (v1.7.7): Tracking value becomes "#{user_id},#{topic_id_context},#{email_id}" and ALSO appends email_id as a separate param on the FINAL destination URL before encoding.
+#        FIX  (v1.7.8): Normalizes bad affiliate URLs where query params are mistakenly placed in the PATH like "/&subid=..." before appending our tracking params.
 
 after_initialize do
   require_dependency "user_notifications"
@@ -260,13 +261,50 @@ after_initialize do
       "#{uid},#{tid},#{eid}"
     end
 
-    # Append aff_sub2/subid2 (value "userid,topicid,emailid") AND append email_id as separate param
-    # BEFORE encoding into /content
+    # ============================================================
+    # URL normalization for broken affiliate URLs
+    # ============================================================
+
+    # Fix URLs like:
+    #   https://mwebquix.com/8920/1851/3/&subid=forum0
+    #   https://mwebquix.com/8920/1851/3/&subid=forum0&x=1
+    #
+    # by moving trailing "/&a=b&c=d" into the query string:
+    #   https://mwebquix.com/8920/1851/3/?subid=forum0&x=1
+    #
+    # Only applies when uri.query is empty/nil (to avoid duplicating).
+    def self.normalize_query_stuck_in_path!(uri)
+      return false unless uri
+      return false if uri.query && !uri.query.to_s.empty?
+
+      path = uri.path.to_s
+      return false if path.empty?
+
+      m = path.match(%r{^(.*?)/&([^#?]+)$})
+      return false unless m
+
+      tail = m[2].to_s
+      return false unless tail.include?("=")
+
+      uri.path = m[1].to_s + "/"
+      uri.query = tail
+      true
+    rescue
+      false
+    end
+
+    # ============================================================
+    # Append tracking params (post-body links) BEFORE encoding into /content
+    # ============================================================
+
     def self.append_tracking_params(url, user_id, topic_id_context, email_id)
       return url if url.to_s.empty?
 
       uri = URI.parse(url)
       return url unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
+
+      # FIX: move "/&a=b&c=d" from PATH into query before adding anything
+      normalize_query_stuck_in_path!(uri)
 
       params = URI.decode_www_form(uri.query || "")
 
@@ -279,7 +317,12 @@ after_initialize do
       end
 
       val = user_topic_email_value(user_id, topic_id_context, email_id)
-      return (tap_set_query(uri, params) || uri.to_s) if val.empty?
+
+      # still set query if we added email_id but val is empty
+      if val.empty?
+        uri.query = URI.encode_www_form(params)
+        return uri.to_s
+      end
 
       TRACKING_PARAMS_TO_APPEND.each do |k|
         kk = k.to_s
@@ -288,16 +331,10 @@ after_initialize do
         params << [kk, val]
       end
 
-      tap_set_query(uri, params) || uri.to_s
-    rescue
-      url
-    end
-
-    def self.tap_set_query(uri, params)
       uri.query = URI.encode_www_form(params)
       uri.to_s
     rescue
-      nil
+      url
     end
 
     # ============================================================
