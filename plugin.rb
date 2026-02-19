@@ -8,7 +8,7 @@
 #        FIX  (v1.6): Topic counting computed BEFORE /content rewrites; Popular Posts boundary uses document order (robust even if whole email is one big table).
 #        PLUS (v1.7): Trim to MIN(max_chars, first visual line break).
 #        FIX  (v1.7.1): Line-break trimming now RESPECTS ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES (keep images/objects when false).
-#        PLUS (v1.7.6): For /content rewrite (post-body links), append aff_sub2 and subid where value is "#{user_id}-#{topic_id_of_current_digest_topic}" (topic id derived from surrounding digest HTML, not from destination URL).
+#        PLUS (v1.7.6): For /content rewrite (post-body links), append aff_sub2 and subid2 where value is "#{user_id}-#{topic_id_of_current_digest_topic}" (topic id derived from surrounding digest HTML, not from destination URL).
 
 after_initialize do
   require_dependency "user_notifications"
@@ -39,7 +39,7 @@ after_initialize do
 
     # These params will be appended to the FINAL destination URL (before base64url-encoding into /content?u=...)
     # Value will be "#{user_id}-#{topic_id_context}" when topic_id_context is known, else "#{user_id}".
-    TRACKING_PARAMS_TO_APPEND = ["aff_sub2", "subid"]
+    TRACKING_PARAMS_TO_APPEND = ["aff_sub2", "subid2"]
 
     ENABLE_TRIM_HTML_PART = true
     HTML_MAX_CHARS        = 300
