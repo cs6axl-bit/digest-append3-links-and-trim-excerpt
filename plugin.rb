@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.8.2
+# version: 1.8.6
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
@@ -13,8 +13,14 @@
 #        FIX  (v1.7.8): Normalizes bad affiliate URLs where query params are mistakenly placed in the PATH like "/&subid=..." before appending our tracking params.
 #        CHANGE (v1.7.9): For post-body link tracking params (aff_sub2/subid2), use "-" separators instead of "," (userid-topicid-emailid).
 #        PLUS (v1.8.0): FINAL PASS: replace origin domain -> target domain on ALL links (including unsubscribe), controlled by plugin settings.
-#        PLUS (v1.8.1): Adds enable/disable switch for domain swapping.
 #        PLUS (v1.8.2): Supports MULTIPLE target domains (comma/newline/space separated) and picks one randomly per email.
+#        FIX  (v1.8.3): Domain swapping can apply to TEXT part as well (plain-text URLs).
+#        PLUS (v1.8.6): Separate switches for:
+#          - HTML <a href> links
+#          - TEXT links
+#          - HTML "everywhere" (images/scripts/css/etc) (independent of links)
+#          - headers (List-Unsubscribe etc.)
+#          - Message-ID header domain
 
 after_initialize do
   require_dependency "user_notifications"
@@ -30,24 +36,18 @@ after_initialize do
 
   module ::DigestAppendData
     # ============================================================
-    # CONFIG
+    # CONFIG (existing behavior)
     # ============================================================
 
     ENABLE_LINK_REWRITE = true
 
-    # Rewrite links inside post bodies (excerpts) to /content?u=<base64url(url)>
     ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS = true
     CONTENT_REDIRECTOR_PATH  = "/content"
     CONTENT_REDIRECTOR_PARAM = "u"
 
-    # Append tracking params to FINAL destination URL BEFORE encoding (post-body links only)
     ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS = true
-
-    # These params will be appended to the FINAL destination URL (before base64url-encoding into /content?u=...)
-    # Value will be "#{user_id}-#{topic_id_context}-#{email_id}" when email_id present.
     TRACKING_PARAMS_TO_APPEND = ["aff_sub2", "subid2"]
 
-    # Also append email_id as a separate param on the FINAL destination URL (pre-encoding)
     ENABLE_APPEND_EMAIL_ID_TO_POST_BODY_LINKS = true
     POST_BODY_EMAIL_ID_PARAM = "email_id"
 
@@ -57,9 +57,6 @@ after_initialize do
     ENABLE_TRIM_TEXT_PART = true
     TEXT_MAX_CHARS        = 300
 
-    # If true, when we trim an excerpt we ALSO remove any trailing HTML nodes
-    # (images, tables, oneboxes, etc.) after the cut point.
-    # If false, we remove ONLY trailing text nodes (images/objects may remain).
     ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES = true
 
     HTML_EXCERPT_SELECTORS = [
@@ -84,7 +81,6 @@ after_initialize do
       "/my/preferences"
     ]
 
-    # Heading text that marks the start of the "Popular Posts" section.
     POPULAR_POSTS_MARKERS = [
       "popular posts",
       "popular topics"
@@ -97,13 +93,39 @@ after_initialize do
     def digest(user, opts = {})
       super.tap do |message|
         email_id = ::DigestAppendData.generate_email_id
-        ::DigestAppendData.process_html_part!(message, user, email_id)
+
+        # Pick ONE target per email only if master enabled and targets exist
+        picked_target =
+          if ::DigestAppendData.setting_enable_domain_swap
+            ::DigestAppendData.pick_target_domain(::DigestAppendData.setting_target_domains)
+          else
+            ""
+          end
+
+        ::DigestAppendData.process_html_part!(message, user, email_id, picked_target)
         ::DigestAppendData.trim_digest_text_part!(message)
+
+        # Domain swap passes (each has its own switch, all gated by master enable)
+        if ::DigestAppendData.setting_enable_domain_swap
+          origin = ::DigestAppendData.setting_origin_domain
+
+          if ::DigestAppendData.setting_swap_text_links
+            ::DigestAppendData.final_swap_domains_in_text_part!(message, origin, picked_target)
+          end
+
+          if ::DigestAppendData.setting_swap_headers
+            ::DigestAppendData.final_swap_domains_in_headers!(message, origin, picked_target)
+          end
+
+          if ::DigestAppendData.setting_swap_message_id
+            ::DigestAppendData.final_swap_domain_in_message_id!(message, origin, picked_target)
+          end
+        end
       end
     end
 
     # ============================================================
-    # Helpers
+    # Basics
     # ============================================================
 
     def self.generate_email_id
@@ -116,7 +138,6 @@ after_initialize do
       Base64.urlsafe_encode64(email, padding: false)
     end
 
-    # IMPORTANT: collapse ALL whitespace (including newlines) into spaces
     def self.normalize_spaces(s)
       s.to_s.gsub(/\s+/, " ").strip
     end
@@ -126,7 +147,6 @@ after_initialize do
       needles.any? { |n| h.include?(n) }
     end
 
-    # Trim to min(max_chars, first newline if it occurs before max_chars).
     def self.smart_trim_plain(text, max_chars)
       raw = text.to_s.gsub(/\r\n?/, "\n")
 
@@ -207,16 +227,9 @@ after_initialize do
       nil
     end
 
-    # Try to infer "current digest topic id" for a given excerpt node.
-    #
-    # Strategy (cheap, robust):
-    # 1) If any ancestor has data-topic-id / data-topicid / topic-id, use it.
-    # 2) Look for the closest preceding p.digest-topic-name that has a /t/... link.
-    # 3) As fallback, look for a preceding /t/... link anywhere (closest) and use that id.
     def self.topic_id_context_for_excerpt(node, base)
       return nil unless node
 
-      # 1) ancestor attributes
       begin
         anc = node.at_xpath("ancestor-or-self::*[@data-topic-id or @data-topicid or @topic-id][1]")
         if anc
@@ -225,10 +238,8 @@ after_initialize do
           return vv if vv.match?(/^\d+$/)
         end
       rescue
-        # ignore
       end
 
-      # 2) closest preceding digest-topic-name
       begin
         a = node.at_xpath("preceding::p[contains(concat(' ', normalize-space(@class), ' '), ' digest-topic-name ')][1]//a[@href][1]")
         if a && a["href"]
@@ -236,10 +247,8 @@ after_initialize do
           return id if id
         end
       rescue
-        # ignore
       end
 
-      # 3) closest preceding /t/ anchor
       begin
         a2 = node.at_xpath("preceding::a[contains(@href, '/t/')][1]")
         if a2 && a2["href"]
@@ -247,18 +256,16 @@ after_initialize do
           return id2 if id2
         end
       rescue
-        # ignore
       end
 
       nil
     end
 
-    # Build "userid-topicid-emailid" (topicid can be blank; keep the middle dash stable)
     def self.user_topic_email_value(user_id, topic_id_context, email_id)
       uid = user_id.to_s
       return "" if uid.empty?
 
-      tid = topic_id_context.to_s # may be blank
+      tid = topic_id_context.to_s
       eid = email_id.to_s
       return "" if eid.empty?
 
@@ -564,8 +571,7 @@ after_initialize do
     end
 
     # ============================================================
-    # FINAL PASS: swap origin domain -> RANDOM target domain on ALL links
-    # Controlled by SiteSetting.digest_append_enable_domain_swap
+    # Domain swap settings (master + per-area switches)
     # ============================================================
 
     def self.setting_enable_domain_swap
@@ -582,7 +588,6 @@ after_initialize do
       ""
     end
 
-    # NEW: multiple targets supported (comma/newline/space separated). Returns array of non-empty entries.
     def self.setting_target_domains
       raw =
         if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_target_domains)
@@ -599,7 +604,68 @@ after_initialize do
       []
     end
 
-    # Pick ONE target domain per email (stable for the duration of that email processing)
+    # Switches you asked for
+    def self.setting_swap_html_links
+      v =
+        if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_domain_swap_html_links)
+          SiteSetting.digest_append_domain_swap_html_links
+        else
+          true
+        end
+      !!v
+    rescue
+      true
+    end
+
+    def self.setting_swap_text_links
+      v =
+        if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_domain_swap_text_links)
+          SiteSetting.digest_append_domain_swap_text_links
+        else
+          false
+        end
+      !!v
+    rescue
+      false
+    end
+
+    # “everywhere (not just links)” = swap HTML resource URL attributes (img/src, script/src, link[href], srcset, etc)
+    def self.setting_swap_everywhere
+      v =
+        if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_domain_swap_everywhere)
+          SiteSetting.digest_append_domain_swap_everywhere
+        else
+          false
+        end
+      !!v
+    rescue
+      false
+    end
+
+    def self.setting_swap_headers
+      v =
+        if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_domain_swap_headers)
+          SiteSetting.digest_append_domain_swap_headers
+        else
+          false
+        end
+      !!v
+    rescue
+      false
+    end
+
+    def self.setting_swap_message_id
+      v =
+        if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_domain_swap_message_id)
+          SiteSetting.digest_append_domain_swap_message_id
+        else
+          false
+        end
+      !!v
+    rescue
+      false
+    end
+
     def self.pick_target_domain(targets)
       return "" if targets.nil? || targets.empty?
       targets[SecureRandom.random_number(targets.size)].to_s
@@ -645,34 +711,116 @@ after_initialize do
       nil
     end
 
-    # target_domain_for_email: pick once in process_html_part! and pass in here so all links in the same email use the same target
-    def self.final_swap_domains_in_all_links!(doc, base, origin_domain, target_domain_for_email)
+    # ============================================================
+    # Domain swap: HTML URLs (links and/or resource attributes)
+    # ============================================================
+
+    def self.rewrite_single_url_string(url_str, base, origin_domain, target_domain_for_email)
+      u = url_str.to_s.strip
+      return nil if u.empty?
+      return nil if u.start_with?("mailto:", "tel:", "sms:", "#")
+
+      abs = u.start_with?("/") ? (base.to_s + u) : u
+
+      begin
+        uri = URI.parse(abs)
+      rescue
+        return nil
+      end
+
+      return nil unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
+      return nil if uri.host.to_s.empty?
+
+      new_host = rewrite_host_if_matches(uri.host, origin_domain, target_domain_for_email)
+      return nil unless new_host
+
+      uri.host = new_host
+      uri.to_s
+    rescue
+      nil
+    end
+
+    def self.rewrite_srcset_value(srcset, base, origin_domain, target_domain_for_email)
+      raw = srcset.to_s
+      return nil if raw.strip.empty?
+
+      parts = raw.split(",").map(&:strip).reject(&:empty?)
+      return nil if parts.empty?
+
+      changed = false
+      new_parts = parts.map do |p|
+        tokens = p.split(/\s+/, 2)
+        url = tokens[0].to_s
+        rest = tokens.length > 1 ? tokens[1].to_s : ""
+
+        rewritten = rewrite_single_url_string(url, base, origin_domain, target_domain_for_email)
+        if rewritten
+          changed = true
+          rest.empty? ? rewritten : "#{rewritten} #{rest}"
+        else
+          p
+        end
+      end
+
+      changed ? new_parts.join(", ") : nil
+    rescue
+      nil
+    end
+
+    def self.swap_html_links_only!(doc, base, origin_domain, target_domain_for_email)
       return false unless doc
-      return false unless setting_enable_domain_swap
+      return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
+
+      changed = false
+      doc.css("a[href]").each do |a|
+        href = a["href"].to_s
+        new_url = rewrite_single_url_string(href, base, origin_domain, target_domain_for_email)
+        next unless new_url
+        a["href"] = new_url
+        changed = true
+      end
+      changed
+    rescue
+      false
+    end
+
+    # "Everywhere" here means resource attributes (NOT dependent on link switch)
+    def self.swap_html_resource_attributes_everywhere!(doc, base, origin_domain, target_domain_for_email)
+      return false unless doc
       return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
 
       changed = false
 
-      doc.css("a[href]").each do |a|
-        href = a["href"].to_s.strip
-        next if href.empty?
-        next if href.start_with?("mailto:", "tel:", "sms:", "#")
+      attr_selectors = [
+        ["img[src]", "src"],
+        ["img[data-src]", "data-src"],
+        ["source[src]", "src"],
+        ["video[src]", "src"],
+        ["audio[src]", "src"],
+        ["iframe[src]", "src"],
+        ["script[src]", "src"],
+        ["link[href]", "href"],   # css/icons etc. (not <a>)
+        ["form[action]", "action"],
+        ["video[poster]", "poster"]
+      ]
 
-        abs = href.start_with?("/") ? (base.to_s + href) : href
-
-        begin
-          uri = URI.parse(abs)
-        rescue
-          next
+      attr_selectors.each do |sel, attr|
+        doc.css(sel).each do |node|
+          v = node[attr].to_s
+          next if v.strip.empty?
+          new_url = rewrite_single_url_string(v, base, origin_domain, target_domain_for_email)
+          next unless new_url
+          node[attr] = new_url
+          changed = true
         end
-        next unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
-        next if uri.host.to_s.empty?
+      end
 
-        new_host = rewrite_host_if_matches(uri.host, origin_domain, target_domain_for_email)
-        next unless new_host
-
-        uri.host = new_host
-        a["href"] = uri.to_s
+      doc.css("img[srcset],source[srcset]").each do |node|
+        v = node["srcset"].to_s
+        next if v.strip.empty?
+        new_srcset = rewrite_srcset_value(v, base, origin_domain, target_domain_for_email)
+        next unless new_srcset
+        node["srcset"] = new_srcset
         changed = true
       end
 
@@ -682,10 +830,171 @@ after_initialize do
     end
 
     # ============================================================
+    # Domain swap: TEXT links
+    # ============================================================
+
+    TEXT_URL_REGEX = %r{https?://[^\s<>"'()]+}i
+
+    def self.strip_trailing_url_punct(url)
+      u = url.to_s
+      return [u, ""] if u.empty?
+
+      suffix = +""
+      while u.length > 0 && u[-1].match?(/[)\].,;:!?]/)
+        suffix.prepend(u[-1])
+        u = u[0..-2]
+      end
+
+      [u, suffix]
+    rescue
+      [url.to_s, ""]
+    end
+
+    def self.swap_domain_in_single_text_url(url, origin_domain, target_domain_for_email)
+      core, suffix = strip_trailing_url_punct(url)
+
+      begin
+        uri = URI.parse(core)
+      rescue
+        return url
+      end
+
+      return url unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
+      return url if uri.host.to_s.empty?
+
+      new_host = rewrite_host_if_matches(uri.host, origin_domain, target_domain_for_email)
+      return url unless new_host
+
+      uri.host = new_host
+      uri.to_s + suffix
+    rescue
+      url
+    end
+
+    def self.final_swap_domains_in_text_part!(message, origin_domain, target_domain_for_email)
+      return false unless message
+      return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
+      return false unless message.respond_to?(:text_part) && message.text_part
+
+      tp = message.text_part
+      text = tp.body&.decoded
+      return false if text.nil? || text.empty?
+
+      changed = false
+      out = text.to_s.gsub(TEXT_URL_REGEX) do |found|
+        swapped = swap_domain_in_single_text_url(found, origin_domain, target_domain_for_email)
+        changed = true if swapped != found
+        swapped
+      end
+
+      tp.body = out if changed
+      changed
+    rescue => e
+      Rails.logger.warn("digest-append3-links-and-trim-excerpt TEXT domain-swap failed: #{e.class}: #{e.message}")
+      false
+    end
+
+    # ============================================================
+    # Domain swap: HEADERS (URL-ish headers)
+    # ============================================================
+
+    HEADERS_TO_DOMAIN_SWAP = [
+      "List-Unsubscribe",
+      "List-Help",
+      "List-Subscribe",
+      "List-Owner"
+    ].freeze
+
+    def self.swap_domains_in_header_value(value, origin_domain, target_domain_for_email)
+      s = value.to_s
+      return s if s.empty?
+
+      s.gsub(TEXT_URL_REGEX) do |found|
+        swap_domain_in_single_text_url(found, origin_domain, target_domain_for_email)
+      end
+    rescue
+      value.to_s
+    end
+
+    def self.final_swap_domains_in_headers!(message, origin_domain, target_domain_for_email)
+      return false unless message
+      return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
+
+      changed = false
+
+      HEADERS_TO_DOMAIN_SWAP.each do |hname|
+        begin
+          hdr = message.header[hname]
+          next unless hdr
+
+          old_val = hdr.to_s
+          next if old_val.to_s.strip.empty?
+
+          new_val = swap_domains_in_header_value(old_val, origin_domain, target_domain_for_email)
+          next if new_val == old_val
+
+          message.header[hname] = new_val
+          changed = true
+        rescue
+          next
+        end
+      end
+
+      changed
+    rescue
+      false
+    end
+
+    # ============================================================
+    # Domain swap: Message-ID header (domain after @ inside <...>)
+    # ============================================================
+
+    def self.swap_message_id_value(value, origin_domain, target_domain_for_email)
+      s = value.to_s.strip
+      return s if s.empty?
+
+      # Typical: <uuid@myhealthyhaven.org>
+      m = s.match(/<([^<>@\s]+)@([^<>@\s]+)>/)
+      return s unless m
+
+      local = m[1].to_s
+      host  = m[2].to_s
+      return s if local.empty? || host.empty?
+
+      new_host = rewrite_host_if_matches(host, origin_domain, target_domain_for_email)
+      return s unless new_host
+
+      s.sub(/<#{Regexp.escape(local)}@#{Regexp.escape(host)}>/, "<#{local}@#{new_host}>")
+    rescue
+      value.to_s
+    end
+
+    def self.final_swap_domain_in_message_id!(message, origin_domain, target_domain_for_email)
+      return false unless message
+      return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
+
+      begin
+        hdr = message.header["Message-ID"]
+        return false unless hdr
+
+        old_val = hdr.to_s
+        return false if old_val.to_s.strip.empty?
+
+        new_val = swap_message_id_value(old_val, origin_domain, target_domain_for_email)
+        return false if new_val == old_val
+
+        message.header["Message-ID"] = new_val
+        true
+      rescue
+        false
+      end
+    end
+
+    # ============================================================
     # HTML processing (single Nokogiri pass)
     # ============================================================
 
-    def self.process_html_part!(message, user, email_id)
+    def self.process_html_part!(message, user, email_id, target_domain_for_email = "")
       return if message.nil?
       return unless ENABLE_LINK_REWRITE || ENABLE_TRIM_HTML_PART || ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
 
@@ -730,9 +1039,7 @@ after_initialize do
       doc = Nokogiri::HTML(body)
       changed = false
 
-      # v1.6: compute primary topic count NOW (before any /content rewrites)
       primary_topic_count = primary_topic_count_before_popular(doc)
-
       skip_trim = (primary_topic_count == 1)
       do_trim = primary_topic_count.nil? ? true : (primary_topic_count > 1)
 
@@ -815,7 +1122,6 @@ after_initialize do
                 next
               end
             rescue
-              # ignore
             end
 
             final_dest =
@@ -855,13 +1161,19 @@ after_initialize do
         end
       end
 
-      # 4) FINAL PASS: swap origin domain -> ONE RANDOM target domain for this email (including unsubscribe/preferences)
-      if setting_enable_domain_swap
+      # 4) FINAL PASS: domain swap in HTML (switches)
+      if setting_enable_domain_swap && !target_domain_for_email.to_s.strip.empty?
         origin = setting_origin_domain
-        targets = setting_target_domains
-        picked = pick_target_domain(targets)
-        if final_swap_domains_in_all_links!(doc, base, origin, picked)
-          changed = true
+        picked = target_domain_for_email.to_s
+
+        # HTML links (<a href>)
+        if setting_swap_html_links
+          changed = true if swap_html_links_only!(doc, base, origin, picked)
+        end
+
+        # HTML "everywhere" (resource attributes)
+        if setting_swap_everywhere
+          changed = true if swap_html_resource_attributes_everywhere!(doc, base, origin, picked)
         end
       end
 
