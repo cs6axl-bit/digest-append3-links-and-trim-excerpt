@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.8.6
+# version: 1.8.7
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
@@ -21,6 +21,9 @@
 #          - HTML "everywhere" (images/scripts/css/etc) (independent of links)
 #          - headers (List-Unsubscribe etc.)
 #          - Message-ID header domain
+#        FIX  (v1.8.7):
+#          - Header swapping now rewrites header FIELDS IN-PLACE (prevents duplicate List-Unsubscribe lines).
+#          - Message-ID swapping now reads header VALUE (not "Message-ID: ...") so regex matches.
 
 after_initialize do
   require_dependency "user_notifications"
@@ -916,6 +919,7 @@ after_initialize do
       value.to_s
     end
 
+    # FIX: rewrite existing header FIELDS IN-PLACE (prevents creating duplicate List-Unsubscribe)
     def self.final_swap_domains_in_headers!(message, origin_domain, target_domain_for_email)
       return false unless message
       return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
@@ -924,24 +928,27 @@ after_initialize do
 
       HEADERS_TO_DOMAIN_SWAP.each do |hname|
         begin
-          hdr = message.header[hname]
-          next unless hdr
+          fields = message.header.fields.select { |f| f.name.to_s.casecmp?(hname) }
+          next if fields.empty?
 
-          old_val = hdr.to_s
-          next if old_val.to_s.strip.empty?
+          fields.each do |f|
+            old_val = f.value.to_s
+            next if old_val.strip.empty?
 
-          new_val = swap_domains_in_header_value(old_val, origin_domain, target_domain_for_email)
-          next if new_val == old_val
+            new_val = swap_domains_in_header_value(old_val, origin_domain, target_domain_for_email)
+            next if new_val == old_val
 
-          message.header[hname] = new_val
-          changed = true
+            f.value = new_val
+            changed = true
+          end
         rescue
           next
         end
       end
 
       changed
-    rescue
+    rescue => e
+      Rails.logger.warn("digest-append3-links-and-trim-excerpt HEADER domain-swap failed: #{e.class}: #{e.message}")
       false
     end
 
@@ -969,23 +976,25 @@ after_initialize do
       value.to_s
     end
 
+    # FIX: read header VALUE (not "Message-ID: ...") so regex matches
     def self.final_swap_domain_in_message_id!(message, origin_domain, target_domain_for_email)
       return false unless message
       return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
 
       begin
-        hdr = message.header["Message-ID"]
+        hdr = message.header["Message-Id"] || message.header["Message-ID"]
         return false unless hdr
 
-        old_val = hdr.to_s
-        return false if old_val.to_s.strip.empty?
+        old_val = (hdr.respond_to?(:value) ? hdr.value : hdr.to_s).to_s.strip
+        return false if old_val.empty?
 
         new_val = swap_message_id_value(old_val, origin_domain, target_domain_for_email)
         return false if new_val == old_val
 
         message.header["Message-ID"] = new_val
         true
-      rescue
+      rescue => e
+        Rails.logger.warn("digest-append3-links-and-trim-excerpt Message-ID domain-swap failed: #{e.class}: #{e.message}")
         false
       end
     end
