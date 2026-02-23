@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.7.9
+# version: 1.8.2
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS (v1.4): Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS (v1.5): If there is only one p.digest-topic-name in HTML, skip excerpt trimming entirely (fast + accurate).
@@ -12,6 +12,9 @@
 #        PLUS (v1.7.7): Tracking value becomes "#{user_id}-#{topic_id_context}-#{email_id}" and ALSO appends email_id as a separate param on the FINAL destination URL before encoding.
 #        FIX  (v1.7.8): Normalizes bad affiliate URLs where query params are mistakenly placed in the PATH like "/&subid=..." before appending our tracking params.
 #        CHANGE (v1.7.9): For post-body link tracking params (aff_sub2/subid2), use "-" separators instead of "," (userid-topicid-emailid).
+#        PLUS (v1.8.0): FINAL PASS: replace origin domain -> target domain on ALL links (including unsubscribe), controlled by plugin settings.
+#        PLUS (v1.8.1): Adds enable/disable switch for domain swapping.
+#        PLUS (v1.8.2): Supports MULTIPLE target domains (comma/newline/space separated) and picks one randomly per email.
 
 after_initialize do
   require_dependency "user_notifications"
@@ -266,14 +269,6 @@ after_initialize do
     # URL normalization for broken affiliate URLs
     # ============================================================
 
-    # Fix URLs like:
-    #   https://mwebquix.com/8920/1851/3/&subid=forum0
-    #   https://mwebquix.com/8920/1851/3/&subid=forum0&x=1
-    #
-    # by moving trailing "/&a=b&c=d" into the query string:
-    #   https://mwebquix.com/8920/1851/3/?subid=forum0&x=1
-    #
-    # Only applies when uri.query is empty/nil (to avoid duplicating).
     def self.normalize_query_stuck_in_path!(uri)
       return false unless uri
       return false if uri.query && !uri.query.to_s.empty?
@@ -304,12 +299,10 @@ after_initialize do
       uri = URI.parse(url)
       return url unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
 
-      # FIX: move "/&a=b&c=d" from PATH into query before adding anything
       normalize_query_stuck_in_path!(uri)
 
       params = URI.decode_www_form(uri.query || "")
 
-      # email_id as separate param
       if ENABLE_APPEND_EMAIL_ID_TO_POST_BODY_LINKS
         k = POST_BODY_EMAIL_ID_PARAM.to_s
         if !k.empty? && email_id.to_s != "" && !params.any? { |kk, _| kk == k }
@@ -319,7 +312,6 @@ after_initialize do
 
       val = user_topic_email_value(user_id, topic_id_context, email_id)
 
-      # still set query if we added email_id but val is empty
       if val.empty?
         uri.query = URI.encode_www_form(params)
         return uri.to_s
@@ -366,10 +358,6 @@ after_initialize do
       true
     end
 
-    # ============================================================
-    # Primary topic counting BEFORE Popular Posts (v1.6 fix)
-    # ============================================================
-
     def self.primary_topic_count_before_popular(doc)
       return nil unless doc
       base   = Discourse.base_url
@@ -377,7 +365,6 @@ after_initialize do
 
       keys = []
 
-      # 1) Prefer digest topic-name blocks
       doc.css("p.digest-topic-name").each do |p|
         next unless before_marker?(p, marker)
 
@@ -395,7 +382,6 @@ after_initialize do
       keys = keys.compact.uniq
       return keys.size if keys.any?
 
-      # 2) Fallback: scan anchors for /t/ ids (before marker)
       ids = []
       doc.css("a[href]").each do |a|
         next unless before_marker?(a, marker)
@@ -483,7 +469,6 @@ after_initialize do
       boundary
     end
 
-    # Remove ONLY text nodes after a given end node (keeps images/objects).
     def self.remove_text_nodes_after_end!(root, end_node)
       return false unless root && end_node
       root.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]").each do |tn|
@@ -495,14 +480,9 @@ after_initialize do
       false
     end
 
-    # ============================================================
-    # Line-break trimming (respects ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES)
-    # ============================================================
-
     def self.trim_html_at_first_line_break!(node, max_chars)
       return false unless node
 
-      # 1) <br> is the strongest "line break" signal
       br = node.at_css("br")
       if br
         before_len = normalize_spaces(text_before_node(node, br)).length
@@ -510,14 +490,13 @@ after_initialize do
           if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
             remove_following_siblings_up_to_root!(br, node)
           else
-            remove_text_nodes_after_end!(node, br) # keep images/objects
+            remove_text_nodes_after_end!(node, br)
           end
           br.remove
           return true
         end
       end
 
-      # 2) End of first paragraph/list item boundary
       boundary = node.at_css("p,li")
       if boundary
         kept_len = normalize_spaces(boundary.text).length
@@ -526,7 +505,7 @@ after_initialize do
             remove_following_siblings_up_to_root!(boundary, node)
           else
             end_node = end_node_for_kept_region(boundary)
-            remove_text_nodes_after_end!(node, end_node) # keep images/objects
+            remove_text_nodes_after_end!(node, end_node)
           end
           return true
         end
@@ -536,10 +515,6 @@ after_initialize do
     rescue
       false
     end
-
-    # ============================================================
-    # HTML: trim in-place
-    # ============================================================
 
     def self.trim_html_node_in_place!(node, max_chars)
       break_trimmed = trim_html_at_first_line_break!(node, max_chars)
@@ -584,6 +559,124 @@ after_initialize do
       end
 
       trimming_started || break_trimmed
+    rescue
+      false
+    end
+
+    # ============================================================
+    # FINAL PASS: swap origin domain -> RANDOM target domain on ALL links
+    # Controlled by SiteSetting.digest_append_enable_domain_swap
+    # ============================================================
+
+    def self.setting_enable_domain_swap
+      v = (defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_enable_domain_swap)) ? SiteSetting.digest_append_enable_domain_swap : false
+      !!v
+    rescue
+      false
+    end
+
+    def self.setting_origin_domain
+      v = (defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_origin_domain)) ? SiteSetting.digest_append_origin_domain : ""
+      v.to_s.strip
+    rescue
+      ""
+    end
+
+    # NEW: multiple targets supported (comma/newline/space separated). Returns array of non-empty entries.
+    def self.setting_target_domains
+      raw =
+        if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_target_domains)
+          SiteSetting.digest_append_target_domains
+        else
+          ""
+        end
+
+      raw.to_s
+         .split(/[\s,]+/)
+         .map { |x| x.to_s.strip }
+         .reject(&:empty?)
+    rescue
+      []
+    end
+
+    # Pick ONE target domain per email (stable for the duration of that email processing)
+    def self.pick_target_domain(targets)
+      return "" if targets.nil? || targets.empty?
+      targets[SecureRandom.random_number(targets.size)].to_s
+    rescue
+      targets.first.to_s
+    end
+
+    def self.normalize_host_only(s)
+      x = s.to_s.strip
+      return "" if x.empty?
+      x = x.sub(%r{\Ahttps?://}i, "")
+      x = x.split("/").first.to_s
+      x = x.split("?").first.to_s
+      x = x.split("#").first.to_s
+      x.downcase
+    rescue
+      ""
+    end
+
+    # If host == origin OR host ends with ".origin", replace just the origin suffix, preserving subdomain prefix.
+    def self.rewrite_host_if_matches(host, origin, target)
+      h = host.to_s
+      return nil if h.empty?
+
+      o = normalize_host_only(origin)
+      t = normalize_host_only(target)
+      return nil if o.empty? || t.empty?
+      return nil if normalize_host_only(h) == t
+
+      h_lc = h.downcase
+      if h_lc == o
+        return target.to_s.strip
+      end
+
+      suffix = ".#{o}"
+      if h_lc.end_with?(suffix)
+        prefix = h[0, h.length - suffix.length]
+        return "#{prefix}.#{target.to_s.strip}"
+      end
+
+      nil
+    rescue
+      nil
+    end
+
+    # target_domain_for_email: pick once in process_html_part! and pass in here so all links in the same email use the same target
+    def self.final_swap_domains_in_all_links!(doc, base, origin_domain, target_domain_for_email)
+      return false unless doc
+      return false unless setting_enable_domain_swap
+      return false if origin_domain.to_s.strip.empty? || target_domain_for_email.to_s.strip.empty?
+
+      changed = false
+
+      doc.css("a[href]").each do |a|
+        href = a["href"].to_s.strip
+        next if href.empty?
+        next if href.start_with?("mailto:", "tel:", "sms:", "#")
+
+        abs = href.start_with?("/") ? (base.to_s + href) : href
+
+        begin
+          uri = URI.parse(abs)
+        rescue
+          next
+        end
+        next unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
+        next if uri.host.to_s.empty?
+
+        new_host = rewrite_host_if_matches(uri.host, origin_domain, target_domain_for_email)
+        next unless new_host
+
+        uri.host = new_host
+        a["href"] = uri.to_s
+        changed = true
+      end
+
+      changed
     rescue
       false
     end
@@ -640,10 +733,7 @@ after_initialize do
       # v1.6: compute primary topic count NOW (before any /content rewrites)
       primary_topic_count = primary_topic_count_before_popular(doc)
 
-      # Skip trim ONLY when we are confident it's exactly 1.
       skip_trim = (primary_topic_count == 1)
-
-      # If unknown (nil), fail-open to trimming when enabled.
       do_trim = primary_topic_count.nil? ? true : (primary_topic_count > 1)
 
       # 1) rewrite INTERNAL links: add isdigest/u/dayofweek/email_id
@@ -706,7 +796,6 @@ after_initialize do
             .uniq
 
         excerpt_nodes.each do |node|
-          # derive topic-id context ONCE per excerpt node
           topic_ctx = topic_id_context_for_excerpt(node, base)
 
           node.css("a[href]").each do |a|
@@ -719,7 +808,6 @@ after_initialize do
             next if abs0.nil?
             next unless http_url?(abs0)
 
-            # skip if it's already /content
             begin
               u0 = URI.parse(abs0)
               b0 = URI.parse(base)
@@ -767,6 +855,16 @@ after_initialize do
         end
       end
 
+      # 4) FINAL PASS: swap origin domain -> ONE RANDOM target domain for this email (including unsubscribe/preferences)
+      if setting_enable_domain_swap
+        origin = setting_origin_domain
+        targets = setting_target_domains
+        picked = pick_target_domain(targets)
+        if final_swap_domains_in_all_links!(doc, base, origin, picked)
+          changed = true
+        end
+      end
+
       html_part.body = doc.to_html if changed
     rescue => e
       Rails.logger.warn("digest-append3-links-and-trim-excerpt HTML process failed: #{e.class}: #{e.message}")
@@ -806,7 +904,7 @@ after_initialize do
       ids = scoped_text.scan(%r{/t/(?:[^/\s]+/)?(\d+)}i).flatten.uniq
       ids.size
     rescue
-      999 # fail-open: do NOT accidentally skip trimming
+      999
     end
 
     def self.trim_digest_text_part!(message)
@@ -821,7 +919,6 @@ after_initialize do
       t = text.to_s.gsub(/\r\n?/, "\n")
       blocks = t.split(/\n{2,}/)
 
-      # If only one UNIQUE topic_id exists BEFORE "Popular Posts", skip text excerpt trimming entirely
       topic_count = count_topics_in_text_blocks(blocks)
       return if topic_count <= 1
 
