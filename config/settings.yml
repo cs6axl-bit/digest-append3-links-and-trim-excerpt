@@ -1,0 +1,13 @@
+# config/settings.yml
+plugins:
+  digest_append_enable_domain_swap:
+    default: false
+    client: false
+
+  digest_append_origin_domain:
+    default: ""
+    client: false
+
+  digest_append_target_domain:
+    default: ""
+    client: false
