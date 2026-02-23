@@ -8,6 +8,8 @@ plugins:
     default: ""
     client: false
 
-  digest_append_target_domain:
+  # MULTIPLE targets: comma / space / newline separated.
+  # Example: "track1.myhealthyhaven.org, track2.myhealthyhaven.org track3.myhealthyhaven.org"
+  digest_append_target_domains:
     default: ""
     client: false
