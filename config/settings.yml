@@ -1,39 +1,23 @@
-# config/settings.yml
-
 plugins:
-  # Master enable + domains
   digest_append_enable_domain_swap:
     default: false
     client: true
-
-  digest_append_origin_domain:
-    default: ""
-    client: true
-
   digest_append_target_domains:
     default: ""
     client: true
-
-  # Switches you requested
+    type: list
   digest_append_domain_swap_html_links:
     default: true
     client: true
-
   digest_append_domain_swap_text_links:
     default: false
     client: true
-
-  # Swap HTML resource URLs (images/scripts/css/etc). Independent of html_links.
   digest_append_domain_swap_everywhere:
     default: false
     client: true
-
-  # Swap URL-like values in select headers (List-Unsubscribe, etc.)
   digest_append_domain_swap_headers:
     default: false
     client: true
-
-  # Swap the @domain part inside Message-ID: <...@domain>
   digest_append_domain_swap_message_id:
     default: false
     client: true
