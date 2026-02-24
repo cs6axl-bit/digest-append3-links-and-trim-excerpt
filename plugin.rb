@@ -1,5 +1,4 @@
 # frozen_string_literal: true
-#
 # name: digest-append3-links-and-trim-excerpt
 # version: 1.8.8
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
