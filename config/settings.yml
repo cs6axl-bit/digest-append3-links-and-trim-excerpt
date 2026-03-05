@@ -1,23 +1,130 @@
 plugins:
+  digest_append3_enabled:
+    default: true
+    client: false
+
+  digest_append3_enable_link_rewrite:
+    default: true
+    client: false
+
+  digest_append3_enable_content_redirector_for_post_body_links:
+    default: true
+    client: false
+
+  digest_append3_content_redirector_path:
+    default: "/content"
+    type: text
+    client: false
+
+  digest_append3_content_redirector_param:
+    default: "u"
+    type: text
+    client: false
+
+  digest_append3_enable_append_tracking_params_to_post_body_links:
+    default: true
+    client: false
+
+  digest_append3_tracking_params_to_append:
+    default: "aff_sub2,subid2"
+    type: text
+    client: false
+
+  digest_append3_enable_append_email_id_to_post_body_links:
+    default: true
+    client: false
+
+  digest_append3_post_body_email_id_param:
+    default: "email_id"
+    type: text
+    client: false
+
+  digest_append3_enable_trim_html_part:
+    default: true
+    client: false
+
+  digest_append3_html_max_chars:
+    default: 300
+    type: integer
+    client: false
+
+  digest_append3_enable_trim_text_part:
+    default: true
+    client: false
+
+  digest_append3_text_max_chars:
+    default: 300
+    type: integer
+    client: false
+
+  digest_append3_enable_trim_html_remove_trailing_nodes:
+    default: true
+    client: false
+
+  digest_append3_html_excerpt_selectors:
+    default: |
+      .digest-post-excerpt
+      .post-excerpt
+      .excerpt
+      .topic-excerpt
+      div[itemprop='articleBody']
+    type: text
+    client: false
+
+  digest_append3_never_touch_href_substrings:
+    default: |
+      /email/unsubscribe
+      /my/preferences
+    type: text
+    client: false
+
+  digest_append3_text_never_trim_keywords:
+    default: |
+      unsubscribe
+      /email/unsubscribe
+      preferences
+      /my/preferences
+    type: text
+    client: false
+
+  digest_append3_popular_posts_markers:
+    default: |
+      popular posts
+      popular topics
+    type: text
+    client: false
+
+  # NEW: If enabled, when HTML trimming runs, skip trimming excerpt nodes that contain any clickable link (<a href>)
+  digest_append3_skip_trim_if_clickable_link_in_body:
+    default: false
+    client: false
+
+  # Existing domain-swap settings referenced by plugin code
   digest_append_enable_domain_swap:
     default: false
-    client: true
+    client: false
+
   digest_append_target_domains:
     default: ""
-    client: true
-    type: list
+    type: text
+    client: false
+
   digest_append_domain_swap_html_links:
     default: true
-    client: true
+    client: false
+
   digest_append_domain_swap_text_links:
     default: false
-    client: true
+    client: false
+
   digest_append_domain_swap_everywhere:
     default: false
-    client: true
+    client: false
+
   digest_append_domain_swap_headers:
     default: false
-    client: true
+    client: false
+
   digest_append_domain_swap_message_id:
     default: false
-    client: true
+    client: false
