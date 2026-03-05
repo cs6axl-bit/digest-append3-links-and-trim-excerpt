@@ -1,11 +1,13 @@
 # frozen_string_literal: true
 # name: digest-append3-links-and-trim-excerpt
-# version: 1.8.8
+# version: 1.9.0
 # about: Appends isdigest=1, u=<user_id>, dayofweek=<base64url(email)>, email_id=<20-digit> to internal links in Activity Summary (digest) emails.
 #        PLUS: Rewrites ALL links inside post excerpt bodies to /content?u=<base64url(final_url)> so email clients show only local links.
 #        PLUS: Trims excerpts (HTML + TEXT) with “Popular Posts” boundary handling + first-line-break trimming.
 #        PLUS: FINAL PASS: replace Discourse hostname -> picked target domain on links/resources/headers/message-id via plugin settings.
-#        CHANGE (v1.8.8): Origin domain setting removed — origin is ALWAYS Discourse.base_url host (the Discourse hostname).
+#        CHANGE (v1.9.0): New setting: if enabled, do NOT trim excerpt nodes that contain any clickable link (<a href>) in the topic body.
+
+enabled_site_setting :digest_append3_enabled
 
 after_initialize do
   require_dependency "user_notifications"
@@ -21,65 +23,183 @@ after_initialize do
 
   module ::DigestAppendData
     # ============================================================
-    # CONFIG (existing behavior)
+    # Settings helpers
     # ============================================================
 
-    ENABLE_LINK_REWRITE = true
+    def self.setting_enabled
+      !!SiteSetting.digest_append3_enabled
+    rescue
+      false
+    end
 
-    ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS = true
-    CONTENT_REDIRECTOR_PATH  = "/content"
-    CONTENT_REDIRECTOR_PARAM = "u"
+    def self.setting_enable_link_rewrite
+      !!SiteSetting.digest_append3_enable_link_rewrite
+    rescue
+      true
+    end
 
-    ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS = true
-    TRACKING_PARAMS_TO_APPEND = ["aff_sub2", "subid2"]
+    def self.setting_enable_content_redirector_for_post_body_links
+      !!SiteSetting.digest_append3_enable_content_redirector_for_post_body_links
+    rescue
+      true
+    end
 
-    ENABLE_APPEND_EMAIL_ID_TO_POST_BODY_LINKS = true
-    POST_BODY_EMAIL_ID_PARAM = "email_id"
+    def self.setting_content_redirector_path
+      v = SiteSetting.digest_append3_content_redirector_path.to_s
+      v = "/content" if v.strip.empty?
+      v.start_with?("/") ? v : "/#{v}"
+    rescue
+      "/content"
+    end
 
-    ENABLE_TRIM_HTML_PART = true
-    HTML_MAX_CHARS        = 300
+    def self.setting_content_redirector_param
+      v = SiteSetting.digest_append3_content_redirector_param.to_s.strip
+      v.empty? ? "u" : v
+    rescue
+      "u"
+    end
 
-    ENABLE_TRIM_TEXT_PART = true
-    TEXT_MAX_CHARS        = 300
+    def self.setting_enable_append_tracking_params_to_post_body_links
+      !!SiteSetting.digest_append3_enable_append_tracking_params_to_post_body_links
+    rescue
+      true
+    end
 
-    ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES = true
+    def self.setting_tracking_params_to_append
+      raw = SiteSetting.digest_append3_tracking_params_to_append.to_s
+      raw.split(/[\s,]+/).map(&:strip).reject(&:empty?)
+    rescue
+      ["aff_sub2", "subid2"]
+    end
 
-    HTML_EXCERPT_SELECTORS = [
-      ".digest-post-excerpt",
-      ".post-excerpt",
-      ".excerpt",
-      ".topic-excerpt",
-      "div[itemprop='articleBody']"
-    ]
+    def self.setting_enable_append_email_id_to_post_body_links
+      !!SiteSetting.digest_append3_enable_append_email_id_to_post_body_links
+    rescue
+      true
+    end
 
-    NEVER_TOUCH_HREF_SUBSTRINGS = [
-      "/email/unsubscribe",
-      "/my/preferences"
-    ]
+    def self.setting_post_body_email_id_param
+      v = SiteSetting.digest_append3_post_body_email_id_param.to_s.strip
+      v.empty? ? "email_id" : v
+    rescue
+      "email_id"
+    end
 
-    TEXT_TOPIC_URL_REGEX = %r{(^|\s)(https?://\S+)?/t/[^ \n]+}i
+    def self.setting_enable_trim_html_part
+      !!SiteSetting.digest_append3_enable_trim_html_part
+    rescue
+      true
+    end
 
-    TEXT_NEVER_TRIM_KEYWORDS = [
-      "unsubscribe",
-      "/email/unsubscribe",
-      "preferences",
-      "/my/preferences"
-    ]
+    def self.setting_html_max_chars
+      v = SiteSetting.digest_append3_html_max_chars.to_i
+      v > 0 ? v : 300
+    rescue
+      300
+    end
 
-    POPULAR_POSTS_MARKERS = [
-      "popular posts",
-      "popular topics"
-    ]
+    def self.setting_enable_trim_text_part
+      !!SiteSetting.digest_append3_enable_trim_text_part
+    rescue
+      true
+    end
+
+    def self.setting_text_max_chars
+      v = SiteSetting.digest_append3_text_max_chars.to_i
+      v > 0 ? v : 300
+    rescue
+      300
+    end
+
+    def self.setting_enable_trim_html_remove_trailing_nodes
+      !!SiteSetting.digest_append3_enable_trim_html_remove_trailing_nodes
+    rescue
+      true
+    end
+
+    def self.setting_html_excerpt_selectors
+      raw = SiteSetting.digest_append3_html_excerpt_selectors.to_s
+      arr = raw.split(/\r?\n/).map(&:strip).reject(&:empty?)
+      arr.presence || [
+        ".digest-post-excerpt",
+        ".post-excerpt",
+        ".excerpt",
+        ".topic-excerpt",
+        "div[itemprop='articleBody']"
+      ]
+    rescue
+      [
+        ".digest-post-excerpt",
+        ".post-excerpt",
+        ".excerpt",
+        ".topic-excerpt",
+        "div[itemprop='articleBody']"
+      ]
+    end
+
+    def self.setting_never_touch_href_substrings
+      raw = SiteSetting.digest_append3_never_touch_href_substrings.to_s
+      arr = raw.split(/\r?\n/).map(&:strip).reject(&:empty?)
+      arr.presence || [
+        "/email/unsubscribe",
+        "/my/preferences"
+      ]
+    rescue
+      [
+        "/email/unsubscribe",
+        "/my/preferences"
+      ]
+    end
+
+    def self.setting_text_never_trim_keywords
+      raw = SiteSetting.digest_append3_text_never_trim_keywords.to_s
+      arr = raw.split(/\r?\n/).map(&:strip).reject(&:empty?)
+      arr.presence || [
+        "unsubscribe",
+        "/email/unsubscribe",
+        "preferences",
+        "/my/preferences"
+      ]
+    rescue
+      [
+        "unsubscribe",
+        "/email/unsubscribe",
+        "preferences",
+        "/my/preferences"
+      ]
+    end
+
+    def self.setting_popular_posts_markers
+      raw = SiteSetting.digest_append3_popular_posts_markers.to_s
+      arr = raw.split(/\r?\n/).map(&:strip).reject(&:empty?).map(&:downcase)
+      arr.presence || [
+        "popular posts",
+        "popular topics"
+      ]
+    rescue
+      [
+        "popular posts",
+        "popular topics"
+      ]
+    end
+
+    # NEW: if enabled, when trimming is active, do NOT trim excerpt nodes that contain any clickable link
+    def self.setting_skip_trim_if_clickable_link_in_body
+      !!SiteSetting.digest_append3_skip_trim_if_clickable_link_in_body
+    rescue
+      false
+    end
 
     # ============================================================
     # Hook
     # ============================================================
 
     def digest(user, opts = {})
+      return super unless ::DigestAppendData.setting_enabled
+
       super.tap do |message|
         email_id = ::DigestAppendData.generate_email_id
 
-        # Pick ONE target per email only if master enabled and targets exist
         picked_target =
           if ::DigestAppendData.setting_enable_domain_swap
             ::DigestAppendData.pick_target_domain(::DigestAppendData.setting_target_domains)
@@ -90,7 +210,6 @@ after_initialize do
         ::DigestAppendData.process_html_part!(message, user, email_id, picked_target)
         ::DigestAppendData.trim_digest_text_part!(message)
 
-        # Domain swap passes (each has its own switch, all gated by master enable)
         if ::DigestAppendData.setting_enable_domain_swap
           if ::DigestAppendData.setting_swap_text_links
             ::DigestAppendData.final_swap_domains_in_text_part!(message, picked_target)
@@ -110,6 +229,9 @@ after_initialize do
     # ============================================================
     # Basics
     # ============================================================
+
+    TEXT_TOPIC_URL_REGEX = %r{(^|\s)(https?://\S+)?/t/[^ \n]+}i
+    TEXT_URL_REGEX = %r{https?://[^\s<>"'()]+}i
 
     def self.generate_email_id
       SecureRandom.random_number(10**20).to_s.rjust(20, "0")
@@ -169,7 +291,7 @@ after_initialize do
     def self.make_content_redirector_url(final_url, base)
       token = base64url_encode(final_url)
       return nil if token.to_s.empty?
-      "#{base}#{CONTENT_REDIRECTOR_PATH}?#{CONTENT_REDIRECTOR_PARAM}=#{token}"
+      "#{base}#{setting_content_redirector_path}?#{setting_content_redirector_param}=#{token}"
     end
 
     def self.absolute_url_from_href(href, base)
@@ -182,6 +304,23 @@ after_initialize do
     def self.http_url?(url)
       u = URI.parse(url)
       u.is_a?(URI::HTTP) || u.is_a?(URI::HTTPS)
+    rescue
+      false
+    end
+
+    # ============================================================
+    # NEW: clickable-link detector for trim skipping
+    # ============================================================
+
+    def self.node_has_clickable_link?(node, never_touch_substrings)
+      return false unless node
+      node.css("a[href]").any? do |a|
+        href = a["href"].to_s.strip
+        next false if href.empty?
+        next false if href.start_with?("mailto:", "tel:", "sms:", "#")
+        next false if contains_any?(href, never_touch_substrings)
+        true
+      end
     rescue
       false
     end
@@ -293,8 +432,8 @@ after_initialize do
 
       params = URI.decode_www_form(uri.query || "")
 
-      if ENABLE_APPEND_EMAIL_ID_TO_POST_BODY_LINKS
-        k = POST_BODY_EMAIL_ID_PARAM.to_s
+      if setting_enable_append_email_id_to_post_body_links
+        k = setting_post_body_email_id_param.to_s
         if !k.empty? && email_id.to_s != "" && !params.any? { |kk, _| kk == k }
           params << [k, email_id.to_s]
         end
@@ -307,7 +446,7 @@ after_initialize do
         return uri.to_s
       end
 
-      TRACKING_PARAMS_TO_APPEND.each do |k|
+      setting_tracking_params_to_append.each do |k|
         kk = k.to_s
         next if kk.empty?
         next if params.any? { |k2, _| k2 == kk }
@@ -327,7 +466,7 @@ after_initialize do
     def self.node_text_matches_popular?(node)
       t = normalize_spaces(node&.text).downcase
       return false if t.empty?
-      POPULAR_POSTS_MARKERS.any? { |m| t.include?(m) }
+      setting_popular_posts_markers.any? { |m| t.include?(m) }
     rescue
       false
     end
@@ -477,7 +616,7 @@ after_initialize do
       if br
         before_len = normalize_spaces(text_before_node(node, br)).length
         if before_len > 0 && before_len < max_chars && has_content_after_boundary?(br, node)
-          if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
+          if setting_enable_trim_html_remove_trailing_nodes
             remove_following_siblings_up_to_root!(br, node)
           else
             remove_text_nodes_after_end!(node, br)
@@ -491,7 +630,7 @@ after_initialize do
       if boundary
         kept_len = normalize_spaces(boundary.text).length
         if kept_len > 0 && kept_len < max_chars && has_content_after_boundary?(boundary, node)
-          if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
+          if setting_enable_trim_html_remove_trailing_nodes
             remove_following_siblings_up_to_root!(boundary, node)
           else
             end_node = end_node_for_kept_region(boundary)
@@ -532,7 +671,7 @@ after_initialize do
           tn.content = smart_trim_plain(raw, budget)
           trimming_started = true
 
-          if ENABLE_TRIM_HTML_REMOVE_TRAILING_NODES
+          if setting_enable_trim_html_remove_trailing_nodes
             remove_following_siblings_up_to_root!(tn, node)
           else
             text_nodes[(idx + 1)..-1].to_a.each(&:remove)
@@ -554,7 +693,7 @@ after_initialize do
     end
 
     # ============================================================
-    # Domain swap settings (master + per-area switches)
+    # Domain swap settings
     # ============================================================
 
     def self.setting_enable_domain_swap
@@ -580,7 +719,6 @@ after_initialize do
       []
     end
 
-    # Switches
     def self.setting_swap_html_links
       v =
         if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_domain_swap_html_links)
@@ -605,7 +743,6 @@ after_initialize do
       false
     end
 
-    # “everywhere (not just links)” = swap HTML resource URL attributes (img/src, script/src, link[href], srcset, etc)
     def self.setting_swap_everywhere
       v =
         if defined?(SiteSetting) && SiteSetting.respond_to?(:digest_append_domain_swap_everywhere)
@@ -649,7 +786,6 @@ after_initialize do
       targets.first.to_s
     end
 
-    # Origin is ALWAYS the Discourse hostname
     def self.origin_host
       URI.parse(Discourse.base_url.to_s).host.to_s.strip.downcase
     rescue
@@ -668,7 +804,6 @@ after_initialize do
       ""
     end
 
-    # If host == origin OR host ends with ".origin", replace just the origin suffix, preserving subdomain prefix.
     def self.rewrite_host_if_matches_origin(host, target)
       h = host.to_s
       return nil if h.empty?
@@ -695,7 +830,7 @@ after_initialize do
     end
 
     # ============================================================
-    # Domain swap: HTML URLs (links and/or resource attributes)
+    # Domain swap: HTML URLs
     # ============================================================
 
     def self.rewrite_single_url_string(url_str, base, target_domain_for_email)
@@ -767,7 +902,6 @@ after_initialize do
       false
     end
 
-    # "Everywhere" here means resource attributes (NOT dependent on link switch)
     def self.swap_html_resource_attributes_everywhere!(doc, base, target_domain_for_email)
       return false unless doc
       return false if target_domain_for_email.to_s.strip.empty?
@@ -782,7 +916,7 @@ after_initialize do
         ["audio[src]", "src"],
         ["iframe[src]", "src"],
         ["script[src]", "src"],
-        ["link[href]", "href"],   # css/icons etc. (not <a>)
+        ["link[href]", "href"],
         ["form[action]", "action"],
         ["video[poster]", "poster"]
       ]
@@ -815,8 +949,6 @@ after_initialize do
     # ============================================================
     # Domain swap: TEXT links
     # ============================================================
-
-    TEXT_URL_REGEX = %r{https?://[^\s<>"'()]+}i
 
     def self.strip_trailing_url_punct(url)
       u = url.to_s
@@ -878,7 +1010,7 @@ after_initialize do
     end
 
     # ============================================================
-    # Domain swap: HEADERS (URL-ish headers)
+    # Domain swap: HEADERS
     # ============================================================
 
     HEADERS_TO_DOMAIN_SWAP = [
@@ -899,7 +1031,6 @@ after_initialize do
       value.to_s
     end
 
-    # rewrite existing header FIELDS IN-PLACE (prevents creating duplicate List-Unsubscribe)
     def self.final_swap_domains_in_headers!(message, target_domain_for_email)
       return false unless message
       return false if target_domain_for_email.to_s.strip.empty?
@@ -933,14 +1064,13 @@ after_initialize do
     end
 
     # ============================================================
-    # Domain swap: Message-ID header (domain after @ inside <...>)
+    # Domain swap: Message-ID
     # ============================================================
 
     def self.swap_message_id_value(value, target_domain_for_email)
       s = value.to_s.strip
       return s if s.empty?
 
-      # Typical: <uuid@myhealthyhaven.org>
       m = s.match(/<([^<>@\s]+)@([^<>@\s]+)>/)
       return s unless m
 
@@ -956,7 +1086,6 @@ after_initialize do
       value.to_s
     end
 
-    # read header VALUE (not "Message-ID: ...") so regex matches
     def self.final_swap_domain_in_message_id!(message, target_domain_for_email)
       return false unless message
       return false if target_domain_for_email.to_s.strip.empty?
@@ -980,12 +1109,12 @@ after_initialize do
     end
 
     # ============================================================
-    # HTML processing (single Nokogiri pass)
+    # HTML processing
     # ============================================================
 
     def self.process_html_part!(message, user, email_id, target_domain_for_email = "")
       return if message.nil?
-      return unless ENABLE_LINK_REWRITE || ENABLE_TRIM_HTML_PART || ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
+      return unless setting_enable_link_rewrite || setting_enable_trim_html_part || setting_enable_content_redirector_for_post_body_links
 
       html_part =
         if message.respond_to?(:html_part) && message.html_part
@@ -999,11 +1128,11 @@ after_initialize do
 
       base = Discourse.base_url
 
-      if ENABLE_LINK_REWRITE && !body.include?('href="') && !body.include?("href='")
-        return unless ENABLE_TRIM_HTML_PART
+      if setting_enable_link_rewrite && !body.include?('href="') && !body.include?("href='")
+        return unless setting_enable_trim_html_part
       end
 
-      if ENABLE_TRIM_HTML_PART
+      if setting_enable_trim_html_part
         selector_hints = [
           "digest-post-excerpt",
           "post-excerpt",
@@ -1014,11 +1143,11 @@ after_initialize do
           "digest-topic-name"
         ]
         has_trim_hint = selector_hints.any? { |h| body.include?(h) }
-        return if !has_trim_hint && !ENABLE_LINK_REWRITE && !ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
+        return if !has_trim_hint && !setting_enable_link_rewrite && !setting_enable_content_redirector_for_post_body_links
       end
 
       if !Nokogiri
-        if ENABLE_LINK_REWRITE
+        if setting_enable_link_rewrite
           html_part.body = rewrite_links_regex(body, user, email_id, base)
         end
         return
@@ -1033,7 +1162,7 @@ after_initialize do
       do_trim = primary_topic_count.nil? ? true : (primary_topic_count > 1)
 
       # 1) rewrite INTERNAL links: add isdigest/u/dayofweek/email_id
-      if ENABLE_LINK_REWRITE
+      if setting_enable_link_rewrite
         doc.css("a[href]").each do |a|
           href = a["href"].to_s.strip
           next if href.empty?
@@ -1043,7 +1172,7 @@ after_initialize do
           is_internal = href.start_with?(base)
           next unless is_relative || is_internal
 
-          next if contains_any?(href, NEVER_TOUCH_HREF_SUBSTRINGS)
+          next if contains_any?(href, setting_never_touch_href_substrings)
 
           begin
             uri = URI.parse(is_relative ? (base + href) : href)
@@ -1085,9 +1214,9 @@ after_initialize do
       end
 
       # 2) rewrite ALL links INSIDE excerpt bodies to /content?u=<base64url(final_url)>
-      if ENABLE_CONTENT_REDIRECTOR_FOR_POST_BODY_LINKS
+      if setting_enable_content_redirector_for_post_body_links
         excerpt_nodes =
-          HTML_EXCERPT_SELECTORS
+          setting_html_excerpt_selectors
             .flat_map { |sel| doc.css(sel).to_a }
             .uniq
 
@@ -1098,7 +1227,7 @@ after_initialize do
             href = a["href"].to_s.strip
             next if href.empty?
             next if href.start_with?("mailto:", "tel:", "sms:", "#")
-            next if contains_any?(href, NEVER_TOUCH_HREF_SUBSTRINGS)
+            next if contains_any?(href, setting_never_touch_href_substrings)
 
             abs0 = absolute_url_from_href(href, base)
             next if abs0.nil?
@@ -1107,14 +1236,14 @@ after_initialize do
             begin
               u0 = URI.parse(abs0)
               b0 = URI.parse(base)
-              if u0.host == b0.host && u0.path == CONTENT_REDIRECTOR_PATH
+              if u0.host == b0.host && u0.path == setting_content_redirector_path
                 next
               end
             rescue
             end
 
             final_dest =
-              if ENABLE_APPEND_TRACKING_PARAMS_TO_POST_BODY_LINKS
+              if setting_enable_append_tracking_params_to_post_body_links
                 append_tracking_params(abs0, user.id, topic_ctx, email_id)
               else
                 abs0
@@ -1130,21 +1259,29 @@ after_initialize do
       end
 
       # 3) HTML excerpt trimming
-      if ENABLE_TRIM_HTML_PART && !skip_trim && do_trim
+      if setting_enable_trim_html_part && !skip_trim && do_trim
         nodes =
-          HTML_EXCERPT_SELECTORS
+          setting_html_excerpt_selectors
             .flat_map { |sel| doc.css(sel).to_a }
             .uniq
 
+        never_touch = setting_never_touch_href_substrings
+
         nodes.each do |node|
+          # existing skip: never touch links in node
           begin
             hrefs = node.css("a[href]").map { |x| x["href"].to_s }
-            next if hrefs.any? { |h| contains_any?(h, NEVER_TOUCH_HREF_SUBSTRINGS) }
+            next if hrefs.any? { |h| contains_any?(h, never_touch) }
           rescue
             next
           end
 
-          if trim_html_node_in_place!(node, HTML_MAX_CHARS)
+          # NEW skip: if enabled, do not trim nodes that contain any clickable link
+          if setting_skip_trim_if_clickable_link_in_body
+            next if node_has_clickable_link?(node, never_touch)
+          end
+
+          if trim_html_node_in_place!(node, setting_html_max_chars)
             changed = true
           end
         end
@@ -1154,12 +1291,10 @@ after_initialize do
       if setting_enable_domain_swap && !target_domain_for_email.to_s.strip.empty?
         picked = target_domain_for_email.to_s
 
-        # HTML links (<a href>)
         if setting_swap_html_links
           changed = true if swap_html_links_only!(doc, base, picked)
         end
 
-        # HTML "everywhere" (resource attributes)
         if setting_swap_everywhere
           changed = true if swap_html_resource_attributes_everywhere!(doc, base, picked)
         end
@@ -1179,7 +1314,7 @@ after_initialize do
 
         next %{href="#{url}"} if url.include?("isdigest=") ||
                                  url.include?("email_id=") ||
-                                 contains_any?(url, NEVER_TOUCH_HREF_SUBSTRINGS)
+                                 contains_any?(url, setting_never_touch_href_substrings)
 
         joiner = url.include?("?") ? "&" : "?"
         extra  = "isdigest=1&u=#{user.id}"
@@ -1191,13 +1326,13 @@ after_initialize do
     end
 
     # ============================================================
-    # TEXT trimming (topic-body-only)
+    # TEXT trimming (unchanged)
     # ============================================================
 
     def self.count_topics_in_text_blocks(blocks)
       cutoff = blocks.find_index do |b|
         t = normalize_spaces(b).downcase
-        POPULAR_POSTS_MARKERS.any? { |m| t.include?(m) }
+        setting_popular_posts_markers.any? { |m| t.include?(m) }
       end
 
       scoped_text = cutoff ? blocks[0...cutoff].join("\n\n") : blocks.join("\n\n")
@@ -1209,7 +1344,7 @@ after_initialize do
 
     def self.trim_digest_text_part!(message)
       return if message.nil?
-      return unless ENABLE_TRIM_TEXT_PART
+      return unless setting_enable_trim_text_part
       return unless message.respond_to?(:text_part) && message.text_part
 
       tp = message.text_part
@@ -1229,7 +1364,7 @@ after_initialize do
         next if b.strip.empty?
 
         b_down = b.downcase
-        next if TEXT_NEVER_TRIM_KEYWORDS.any? { |kw| b_down.include?(kw.downcase) }
+        next if setting_text_never_trim_keywords.any? { |kw| b_down.include?(kw.downcase) }
 
         prev = (i > 0) ? blocks[i - 1].to_s : ""
         prev_has_topic_url = !!(prev =~ TEXT_TOPIC_URL_REGEX)
@@ -1237,13 +1372,13 @@ after_initialize do
 
         b2 = b.to_s.gsub(/\r\n?/, "\n")
         nl = b2.index("\n")
-        linebreak_forced = nl && nl > 0 && nl < TEXT_MAX_CHARS
+        linebreak_forced = nl && nl > 0 && nl < setting_text_max_chars
 
         norm_len = normalize_spaces(b2).length
-        need_trim = linebreak_forced || (norm_len > TEXT_MAX_CHARS)
+        need_trim = linebreak_forced || (norm_len > setting_text_max_chars)
         next unless need_trim
 
-        blocks[i] = smart_trim_plain(b2, TEXT_MAX_CHARS)
+        blocks[i] = smart_trim_plain(b2, setting_text_max_chars)
         changed = true
       end
 
