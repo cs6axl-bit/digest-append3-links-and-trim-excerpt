@@ -442,7 +442,7 @@ after_initialize do
       val = user_topic_email_value(user_id, topic_id_context, email_id)
 
       if val.empty?
-        uri.query = URI.encode_www_form(params)
+        uri.query = URI.encode_www_form(with_clickbank_postback_ids(uri, params, user_id, email_id))
         return uri.to_s
       end
 
@@ -453,10 +453,31 @@ after_initialize do
         params << [kk, val]
       end
 
-      uri.query = URI.encode_www_form(params)
+      uri.query = URI.encode_www_form(with_clickbank_postback_ids(uri, params, user_id, email_id))
       uri.to_s
     rescue
       url
+    end
+
+    # ClickBank S2S postback attribution (2026-10-20). ClickBank only passes back hop-link params it knows:
+    # extclid -> {extclid}, contact_id -> {contact_id}. On ClickBank hop links ONLY, add
+    #   extclid    = email_id (20 digits; joins digest_sent_logs -> user, date)
+    #   contact_id = user_id
+    # unless the link already has them. Any other link, or any error: params returned untouched.
+    ENABLE_CLICKBANK_POSTBACK_IDS = true
+    CLICKBANK_HOP_HOST_RE = /(\A|\.)hop\.clickbank\.net\z/i
+
+    def self.with_clickbank_postback_ids(uri, params, user_id, email_id)
+      return params unless ENABLE_CLICKBANK_POSTBACK_IDS
+      return params unless CLICKBANK_HOP_HOST_RE.match?(uri.host.to_s)
+      out = params.dup
+      eid = email_id.to_s
+      uid = user_id.to_s
+      out << ["extclid", eid] if eid.match?(/\A[0-9A-Za-z_-]{1,100}\z/) && out.none? { |k, _| k == "extclid" }
+      out << ["contact_id", uid] if uid.match?(/\A\d{1,20}\z/) && out.none? { |k, _| k == "contact_id" }
+      out
+    rescue
+      params
     end
 
     # ============================================================
