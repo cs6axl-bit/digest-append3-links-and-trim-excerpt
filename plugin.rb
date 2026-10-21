@@ -468,7 +468,8 @@ after_initialize do
     CLICKBANK_HOP_HOST_RE = /(\A|\.)hop\.clickbank\.net\z/i
 
     # Everflow networks (GiddyUp gu-ecom.com, Orbio dsw0trk.com; 2026-10-21): their postbacks return sub1..sub5, so on
-    # those tracking links ONLY add sub1 = email_id and sub3 = user_id (sub2 holds the email key we set in the link).
+    # those tracking links ONLY add sub4 = email_id and sub5 = user_id (sub2 = email key in the link; sub1 is the owner's own
+    # tracking for other traffic, read by the existing shopimaniac postbacks: never touch it).
     EVERFLOW_TRACKING_HOST_RE = /(\A|\.)(gu-ecom\.com|dsw0trk\.com)\z/i
 
     def self.with_clickbank_postback_ids(uri, params, user_id, email_id)
@@ -477,8 +478,8 @@ after_initialize do
         out = params.dup
         eid = email_id.to_s
         uid = user_id.to_s
-        out << ["sub1", eid] if eid.match?(/\A[0-9A-Za-z_-]{1,100}\z/) && out.none? { |k, _| k == "sub1" }
-        out << ["sub3", uid] if uid.match?(/\A\d{1,20}\z/) && out.none? { |k, _| k == "sub3" }
+        out << ["sub4", eid] if eid.match?(/\A[0-9A-Za-z_-]{1,100}\z/) && out.none? { |k, _| k == "sub4" }
+        out << ["sub5", uid] if uid.match?(/\A\d{1,20}\z/) && out.none? { |k, _| k == "sub5" }
         return out
       end
       return params unless CLICKBANK_HOP_HOST_RE.match?(uri.host.to_s)
