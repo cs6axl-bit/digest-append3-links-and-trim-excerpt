@@ -471,10 +471,17 @@ after_initialize do
     # those tracking links ONLY add sub4 = email_id and sub5 = user_id (sub2 = email key in the link; sub1 is the owner's own
     # tracking for other traffic, read by the existing shopimaniac postbacks: never touch it).
     EVERFLOW_TRACKING_HOST_RE = /(\A|\.)(gu-ecom\.com|dsw0trk\.com)\z/i
+    # 2026-10-31: DFO Performance uses many rotating tracking domains (dapidata.com, azncrush.com, …), so also match any
+    # host by the Everflow tracking-link SHAPE: exactly two upper-case codes in the path, e.g. /25MZK5TX/HW59H7N/.
+    EVERFLOW_TRACKING_PATH_RE = %r{\A/[A-Z0-9]{5,10}/[A-Z0-9]{5,10}/?\z}
+
+    def self.everflow_tracking_link?(uri)
+      EVERFLOW_TRACKING_HOST_RE.match?(uri.host.to_s) || EVERFLOW_TRACKING_PATH_RE.match?(uri.path.to_s)
+    end
 
     def self.with_clickbank_postback_ids(uri, params, user_id, email_id)
       return params unless ENABLE_CLICKBANK_POSTBACK_IDS
-      if EVERFLOW_TRACKING_HOST_RE.match?(uri.host.to_s)
+      if everflow_tracking_link?(uri)
         out = params.dup
         eid = email_id.to_s
         uid = user_id.to_s
